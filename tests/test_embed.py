@@ -19,6 +19,90 @@ from reader.embed import (
 PNG = b"\x89PNG\r\n\x1a\n" + b"payload"
 
 
+def _png_bytes(w: int, h: int) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), color="white").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _jpeg_bytes(w: int, h: int) -> bytes:
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (w, h), color="white").save(buf, format="JPEG", quality=95)
+    return buf.getvalue()
+
+
+def test_oversized_image_is_resized_to_cap_and_stays_valid():
+    from PIL import Image
+
+    from reader.embed import resize_image
+    from reader.schema import IMAGE_MAX_PIXELS
+
+    # 3000 x 1000 = 3.0 Mpx, over the 2.4 Mpx cap.
+    data = _png_bytes(3000, 1000)
+    out = resize_image("image/png", data)
+    assert out != data
+    import io
+
+    with Image.open(io.BytesIO(out)) as im:
+        assert im.format == "PNG"
+        assert im.width * im.height <= IMAGE_MAX_PIXELS
+
+
+def test_oversized_jpeg_reencoded_as_jpeg():
+    from PIL import Image
+
+    from reader.embed import resize_image
+    from reader.schema import IMAGE_MAX_PIXELS
+
+    data = _jpeg_bytes(3000, 1000)
+    out = resize_image("image/jpeg", data)
+    assert out != data
+    import io
+
+    with Image.open(io.BytesIO(out)) as im:
+        assert im.format == "JPEG"
+        assert im.width * im.height <= IMAGE_MAX_PIXELS
+
+
+def test_under_cap_image_passed_through_byte_for_byte():
+    from reader.embed import resize_image
+    from reader.schema import IMAGE_MAX_PIXELS
+
+    data = _png_bytes(500, 500)  # 0.25 Mpx, well under the cap
+    assert 500 * 500 <= IMAGE_MAX_PIXELS
+    assert resize_image("image/png", data) is data
+    # ...and the wrap path embeds the original bytes, unmodified.
+    client = EmbedClient("http://gw", "k", "m", http=lambda p: {"data": []})
+    uri = client._to_input(ImageInput("image/png", data))
+    assert uri.endswith(base64.b64encode(data).decode())
+
+
+def test_resize_preserves_aspect_ratio_within_one_pixel():
+    from PIL import Image
+
+    from reader.embed import resize_image
+
+    w, h = 4000, 1000  # 4.0 Mpx, 4:1
+    data = _png_bytes(w, h)
+    out = resize_image("image/png", data)
+    import io
+
+    with Image.open(io.BytesIO(out)) as im:
+        nw, nh = im.width, im.height
+    assert nw * nh <= 2_400_000
+    # Same aspect ratio to within ~1px of the longer edge.
+    assert abs(nw - (w / h) * nh) <= 1
+
+
+
 def test_data_uri_wraps_as_image():
     uri = data_uri("image/png", PNG)
     assert uri.startswith("data:image/png;base64,")

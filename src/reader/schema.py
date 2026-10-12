@@ -22,8 +22,18 @@ EXTRACTOR_VERSION = "1"
 
 #: Version of the embedding *configuration* (model family + prompt/template
 #: choices).  Stamped onto every vector's provenance so a model swap can be
-#: scoped per row.
-EMBED_CONFIG_VERSION = "1"
+#: scoped per row.  Bumped "1" -> "2" when client-side image resizing became
+#: part of the config: rows stamped "1" were embedded at full size (Cohere
+#: clamped anything over ~2.4 Mpx server-side), rows stamped "2" are embedded
+#: at :data:`IMAGE_MAX_PIXELS` or below.
+EMBED_CONFIG_VERSION = "2"
+
+#: Client-side downscale cap for images before they are wrapped as a data URI.
+#: Matches Cohere's own cap: image tokens are area-driven
+#: (``ceil(w/32)*ceil(h/32)+2``) and Cohere downscales anything over ~2.4 Mpx
+#: itself, so uploading more only inflates the payload without changing the
+#: vector.  2,400,000 px = 2.4 Mpx.
+IMAGE_MAX_PIXELS = 2_400_000
 
 #: Turbopuffer namespace holding the derived index.  There is exactly one.
 CHUNKS_NAMESPACE = "chunks"

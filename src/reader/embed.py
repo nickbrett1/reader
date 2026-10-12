@@ -26,7 +26,11 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .schema import COHERE_IMAGE_USD_PER_MTOK, EMBED_CONFIG_VERSION
+from .schema import (
+    COHERE_IMAGE_USD_PER_MTOK,
+    EMBED_CONFIG_VERSION,
+    IMAGE_MAX_PIXELS,
+)
 
 #: Cohere / gateway hard limit is 50,000,000 decoded pixels per batch.
 #: We cap at 40 MP to keep a comfortable safety margin.
@@ -60,6 +64,75 @@ def data_uri(mime: str, data: bytes) -> str:
     if not mime.startswith("image/"):
         raise ValueError(f"not an image mime: {mime!r}")
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def resize_image(mime: str, data: bytes, max_pixels: int = IMAGE_MAX_PIXELS) -> bytes:
+    """Downscale an encoded image so ``w * h <= max_pixels``.
+
+    * Aspect ratio is preserved; the resize uses PIL's deterministic LANCZOS
+      filter so the same input always yields the same output (stable hashes).
+    * An image already at or under the cap is returned **byte-for-byte
+      unchanged** — no re-encode.  That keeps dedupe hashes and existing rows
+      stable.
+    * Only a resized image is re-encoded, back to its original format
+      (JPEG -> JPEG, quality 90, preserving the source's chroma subsampling;
+      PNG -> PNG).
+    * Bytes that PIL cannot decode are passed through untouched, matching
+      :func:`_item_pixels` which treats them as unmeasurable rather than fatal.
+    """
+    import io
+
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            w, h = im.width, im.height
+            if w * h <= max_pixels:
+                return data
+            scale = (max_pixels / (w * h)) ** 0.5
+            # Derive the *shorter* edge from the scale, then derive the longer
+            # edge from it so the aspect ratio survives integer rounding; a
+            # naive round of both edges independently can drift by >1px.
+            if w >= h:
+                nh = max(1, int(h * scale))
+                nw = max(1, round(w * nh / h))
+            else:
+                nw = max(1, int(w * scale))
+                nh = max(1, round(h * nw / w))
+            # Guard against rounding pushing the product back over the cap.
+            while nw * nh > max_pixels and (nw > 1 or nh > 1):
+                if nw >= nh:
+                    nw -= 1
+                else:
+                    nh -= 1
+            # Re-encode to the original mime; fall back to the decoded format
+            # when the mime is something we don't map explicitly.
+            fmt = {
+                "image/png": "PNG",
+                "image/jpeg": "JPEG",
+                "image/jpg": "JPEG",
+            }.get(mime.lower(), im.format)
+            subsampling = None
+            if fmt == "JPEG":
+                from PIL import JpegImagePlugin
+
+                subsampling = JpegImagePlugin.get_sampling(im)
+            resized = im.resize((nw, nh), Image.LANCZOS)
+            buf = io.BytesIO()
+            if fmt == "JPEG":
+                if resized.mode not in ("L", "RGB", "CMYK"):
+                    resized = resized.convert("RGB")
+                save_kwargs: dict[str, Any] = {"format": "JPEG", "quality": 90}
+                if subsampling is not None:
+                    save_kwargs["subsampling"] = subsampling
+                resized.save(buf, **save_kwargs)
+            elif fmt == "PNG":
+                resized.save(buf, format="PNG")
+            else:
+                resized.save(buf, format=fmt)
+            return buf.getvalue()
+    except Exception:
+        return data
 
 
 def image_cost_usd(tokens: int, usd_per_mtok: float = COHERE_IMAGE_USD_PER_MTOK) -> float:
@@ -211,7 +284,7 @@ class EmbedClient:
     def _to_input(self, item: Input) -> str:
         if isinstance(item, TextInput):
             return item.text
-        return data_uri(item.mime, item.data)
+        return data_uri(item.mime, resize_image(item.mime, item.data))
 
     @staticmethod
     def _merge_usage(acc: dict[str, Any], new: dict[str, Any]) -> None:
