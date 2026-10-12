@@ -298,7 +298,9 @@ class LanceIndex:
     def _ensure_indices(self, tbl: Any) -> None:
         names = [i.name for i in tbl.list_indices()]
         if "text_idx" not in names:
-            tbl.create_fts_index("text", replace=True, name="text_idx")
+            from lancedb.index import FTS
+
+            tbl.create_index("text", config=FTS(), replace=True, name="text_idx")
         if tbl.count_rows() >= ANN_INDEX_THRESHOLD and "vector_idx" not in names:
             tbl.create_index(metric=DISTANCE, vector_column_name="vector", name="vector_idx")
 

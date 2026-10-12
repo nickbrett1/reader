@@ -308,6 +308,17 @@ def cmd_index(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _index_id(value: object, default_kind: str = "text") -> str:
+    """Normalise an eval label to an index row id.
+
+    The index keys rows ``<kind>:<record id>`` (``index.text_id`` etc.).  A
+    label may be given already-qualified (``"concept:3"``) or as a bare record
+    id (``3``), which is read as a ``text`` chunk id.
+    """
+    s = str(value)
+    return s if ":" in s else f"{default_kind}:{s}"
+
+
 def cmd_eval(config: Config, args: argparse.Namespace) -> int:
     if args.pin:
         with open_store(config) as store:
@@ -344,11 +355,20 @@ def cmd_eval(config: Config, args: argparse.Namespace) -> int:
                 recalls = []
                 for item in labels:
                     res = client.embed_texts([item["query"]])
+                    # Index row ids are ``<kind>:<record id>`` (e.g. ``text:12``,
+                    # ``concept:3``); a bare label is read as a ``text`` chunk id.
+                    # Retrieve within the kinds the labels name, so an answer of
+                    # a different kind cannot crowd the ranking (§4, honest kind
+                    # filter) — a text-chunk label set eval'ed over ``text`` only.
+                    relevant = {_index_id(r) for r in item.get("relevant", [])}
+                    kinds = sorted({r.split(":", 1)[0] for r in relevant}) or None
                     got = idx.hybrid_query(
-                        vector=res.vectors[0], bm25_text=item["query"], top_k=10
+                        vector=res.vectors[0],
+                        bm25_text=item["query"],
+                        top_k=10,
+                        kinds=kinds,
                     )
                     ids = {str(r["id"]) for r in (got or [])}
-                    relevant = {str(r) for r in item.get("relevant", [])}
                     recalls.append(len(ids & relevant) / len(relevant) if relevant else 0.0)
             except Exception as exc:  # noqa: BLE001 - skip models the gateway lacks
                 print(f"{model}: SKIPPED ({exc})", file=sys.stderr)

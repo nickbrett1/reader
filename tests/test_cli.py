@@ -71,3 +71,13 @@ def test_manifest_records_run(corpus, capsys):
         assert run["verb"] == "manifest" and run["status"] == "ok"
     finally:
         store.close()
+
+
+def test_index_id_normalises_eval_labels():
+    from reader.__main__ import _index_id
+
+    # A bare record id is a text chunk; a qualified id is kept as-is.
+    assert _index_id(12) == "text:12"
+    assert _index_id("12") == "text:12"
+    assert _index_id("concept:3") == "concept:3"
+    assert _index_id("image:7") == "image:7"
