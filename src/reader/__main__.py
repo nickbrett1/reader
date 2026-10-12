@@ -307,16 +307,22 @@ def cmd_eval(config: Config, args: argparse.Namespace) -> int:
         dimensions = cfg["embedding_dimensions"] if cfg else None
         idx = index_mod.Index(config.turbopuffer_api_key, dimensions)
         for model in models:
-            client = EmbedClient(
-                config.litellm_base_url, config.litellm_master_key, model, dimensions
-            )
-            recalls = []
-            for item in labels:
-                res = client.embed_texts([item["query"]])
-                got = idx.hybrid_query(vector=res.vectors[0], bm25_text=item["query"], top_k=10)
-                ids = {str(r["id"]) for r in (got or [])}
-                relevant = {str(r) for r in item.get("relevant", [])}
-                recalls.append(len(ids & relevant) / len(relevant) if relevant else 0.0)
+            try:
+                client = EmbedClient(
+                    config.litellm_base_url, config.litellm_master_key, model, dimensions
+                )
+                recalls = []
+                for item in labels:
+                    res = client.embed_texts([item["query"]])
+                    got = idx.hybrid_query(
+                        vector=res.vectors[0], bm25_text=item["query"], top_k=10
+                    )
+                    ids = {str(r["id"]) for r in (got or [])}
+                    relevant = {str(r) for r in item.get("relevant", [])}
+                    recalls.append(len(ids & relevant) / len(relevant) if relevant else 0.0)
+            except Exception as exc:  # noqa: BLE001 - skip models the gateway lacks
+                print(f"{model}: SKIPPED ({exc})", file=sys.stderr)
+                continue
             mean = sum(recalls) / len(recalls) if recalls else 0.0
             print(f"{model}: recall@10 = {mean:.3f} over {len(labels)} queries")
     return 0

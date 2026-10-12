@@ -69,6 +69,8 @@ def test_embed_texts_orders_by_index_and_wraps_images():
     img_res = client.embed_images([("image/png", PNG)])
     assert len(img_res.vectors) == 1
     assert calls[0]["input"][0].startswith("data:image/png;base64,")
+    # Rule 3: image accounting is flagged unreliable.
+    assert img_res.usage["image_tokens_reliable"] is False
 
 
 def test_empty_input_sends_nothing():

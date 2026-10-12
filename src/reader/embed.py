@@ -160,9 +160,12 @@ class EmbedClient:
                 vectors.append(vec)
                 dims = len(vec)
             self._merge_usage(usage, resp.get("usage", {}))
-        if images and not usage:
-            # Rule 3: the gateway reports nothing useful for image tokens.
-            usage = {"image_tokens_reported": 0, "note": "measure out-of-band"}
+        if images:
+            # Rule 3, confirmed live (2026-10-12): the gateway returns
+            # prompt_tokens=0 / total_tokens=0 / image_tokens=null for an image
+            # embed, so its accounting can never be trusted for images.
+            usage["image_tokens_reliable"] = False
+            usage["note"] = "gateway reports 0 image tokens; measure out-of-band"
         return EmbedResult(vectors=vectors, model=self.model, dimensions=dims, usage=usage)
 
     def embed_texts(self, texts: Sequence[str]) -> EmbedResult:
