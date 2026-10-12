@@ -13,11 +13,22 @@ The index is always rebuildable from SQLite.  If the two disagree, SQLite wins:
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from pathlib import Path
 from typing import Any
 
 from .schema import CHUNK_KINDS, CHUNKS_NAMESPACE
 
 DISTANCE = "cosine"
+
+#: Backend names accepted by :func:`create_index`.  ``local``/``lancedb`` are
+#: the same embedded backend; ``turbopuffer`` is the hosted fallback.
+LOCAL_BACKENDS = frozenset({"local", "lancedb"})
+TURBOPUFFER_BACKEND = "turbopuffer"
+DEFAULT_BACKEND = "lancedb"
+
+#: Above this many rows we build an ANN index; below it LanceDB's flat scan is
+#: faster and avoids training a tiny index.
+ANN_INDEX_THRESHOLD = 256
 
 
 def text_id(chunk_id: int) -> str:
@@ -195,3 +206,234 @@ def _read_blob(path: str) -> bytes:
     from pathlib import Path
 
     return Path(path).read_bytes()
+
+
+# --------------------------------------------------------------------------- #
+# LanceDB backend (the local index)
+# --------------------------------------------------------------------------- #
+
+#: The Lance table columns.  Fixed on purpose: a stable Arrow schema keeps
+#: every ``upsert`` (and the create-then-merge path) consistent, and mirrors
+#: v5's single-namespace design — one table, a ``kind`` column.
+_LANCE_COLUMNS = ("id", "vector", "kind", "text", "book_id", "page_id")
+
+
+class LanceIndex:
+    """Embedded LanceDB index — the ``local`` backend.
+
+    No service, no secret: the index is a directory next to the SQLite record.
+    Vectors are *supplied* (LanceDB never embeds).  Hybrid retrieval is native
+    (BM25 + ANN + RRF), and the whole index is rebuildable from SQLite.
+    """
+
+    def __init__(
+        self,
+        path: Path | str,
+        dimensions: int | None = None,
+        table: str = CHUNKS_NAMESPACE,
+    ) -> None:
+        self.path = Path(path)
+        self.dimensions = dimensions
+        self.table_name = table
+        self._db: Any | None = None
+
+    # --- connection / schema -------------------------------------------------
+
+    @property
+    def db(self) -> Any:
+        if self._db is None:
+            import lancedb
+
+            self.path.mkdir(parents=True, exist_ok=True)
+            self._db = lancedb.connect(str(self.path))
+        return self._db
+
+    def _arrow_schema(self) -> Any:
+        import pyarrow as pa
+
+        if self.dimensions is None:
+            raise DimensionalityNotPinned(
+                "pin embedding_dimensions (run `eval --pin`) before opening the index"
+            )
+        return pa.schema(
+            [
+                pa.field("id", pa.string()),
+                pa.field("vector", pa.list_(pa.float32(), self.dimensions)),
+                pa.field("kind", pa.string()),
+                pa.field("text", pa.string()),
+                pa.field("book_id", pa.int64()),
+                pa.field("page_id", pa.int64()),
+            ]
+        )
+
+    def _table(self) -> Any | None:
+        try:
+            return self.db.open_table(self.table_name)
+        except Exception:  # noqa: BLE001 - table simply does not exist yet
+            return None
+
+    def _records(self, rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        recs: list[dict[str, Any]] = []
+        for r in rows:
+            vec = r.get("vector", [])
+            if len(vec) != self.dimensions:
+                raise ValueError(
+                    f"row {r.get('id')!r} has {len(vec)} dims, expected {self.dimensions}"
+                )
+            kind = r.get("kind")
+            if kind not in CHUNK_KINDS:
+                raise ValueError(f"bad kind: {kind!r}")
+            recs.append(
+                {
+                    "id": str(r["id"]),
+                    "vector": [float(x) for x in vec],
+                    "kind": kind,
+                    "text": r.get("text"),
+                    "book_id": r.get("book_id"),
+                    "page_id": r.get("page_id"),
+                }
+            )
+        return recs
+
+    def _ensure_indices(self, tbl: Any) -> None:
+        names = [i.name for i in tbl.list_indices()]
+        if "text_idx" not in names:
+            tbl.create_fts_index("text", replace=True, name="text_idx")
+        if tbl.count_rows() >= ANN_INDEX_THRESHOLD and "vector_idx" not in names:
+            tbl.create_index(metric=DISTANCE, vector_column_name="vector", name="vector_idx")
+
+    # --- write path ----------------------------------------------------------
+
+    def upsert(self, rows: Sequence[dict[str, Any]]) -> int:
+        if self.dimensions is None:
+            raise DimensionalityNotPinned("pin embedding_dimensions before the first write")
+        recs = self._records(rows)
+        if not recs:
+            return 0
+        import pyarrow as pa
+
+        data = pa.Table.from_pylist(recs, schema=self._arrow_schema())
+        tbl = self._table()
+        if tbl is None:
+            tbl = self.db.create_table(self.table_name, data=data)
+        else:
+            (
+                tbl.merge_insert("id")
+                .when_matched_update_all()
+                .when_not_matched_insert_all()
+                .execute(data)
+            )
+        self._ensure_indices(tbl)
+        return len(recs)
+
+    def optimize(self, cleanup_older_than_days: int | None = None) -> None:
+        """Compact versions and rebuild stale indices (index housekeeping)."""
+        tbl = self._table()
+        if tbl is None:
+            return
+        kwargs = {}
+        if cleanup_older_than_days is not None:
+            from datetime import timedelta
+
+            kwargs["cleanup_older_than"] = timedelta(days=cleanup_older_than_days)
+        tbl.optimize(**kwargs)
+
+    def count(self) -> int:
+        tbl = self._table()
+        return tbl.count_rows() if tbl is not None else 0
+
+    def drop(self) -> None:
+        try:
+            self.db.drop_table(self.table_name)
+        except Exception:  # noqa: BLE001 - nothing to drop
+            pass
+
+    # --- read path -----------------------------------------------------------
+
+    @staticmethod
+    def _where(kinds: Sequence[str] | None, filters: Any | None) -> str:
+        parts: list[str] = []
+        if kinds:
+            literals = ",".join("'" + k.replace("'", "''") + "'" for k in kinds)
+            parts.append(f"kind IN ({literals})")
+        if isinstance(filters, str) and filters:
+            parts.append(f"({filters})")
+        elif isinstance(filters, dict):
+            for key, value in filters.items():
+                parts.append(f"{key} = '{value}'" if isinstance(value, str) else f"{key} = {value}")
+        return " AND ".join(parts)
+
+    def query(
+        self,
+        *,
+        vector: Sequence[float] | None = None,
+        bm25_text: str | None = None,
+        top_k: int = 10,
+        kinds: Sequence[str] | None = None,
+        filters: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.hybrid_query(
+            vector=vector, bm25_text=bm25_text, top_k=top_k, kinds=kinds, filters=filters
+        )
+
+    def hybrid_query(
+        self,
+        vector: Sequence[float] | None = None,
+        bm25_text: str | None = None,
+        top_k: int = 10,
+        filters: Any | None = None,
+        kinds: Sequence[str] | None = None,
+        *,
+        rerank: bool = True,
+    ) -> list[dict[str, Any]]:
+        """BM25 + ANN with native RRF fusion, in one table via the `kind` column."""
+        tbl = self._table()
+        if tbl is None:
+            return []
+        if vector is not None and bm25_text:
+            from lancedb.rerankers import RRFReranker
+
+            q = (
+                tbl.search(
+                    vector_column_name="vector",
+                    query_type="hybrid",
+                    fts_columns="text",
+                )
+                .vector([float(x) for x in vector])
+                .text(bm25_text)
+            )
+            if rerank:
+                q = q.rerank(RRFReranker())
+        elif vector is not None:
+            q = tbl.search([float(x) for x in vector], vector_column_name="vector")
+        elif bm25_text:
+            q = tbl.search(bm25_text, query_type="fts", fts_columns="text")
+        else:
+            return []
+        where = self._where(kinds, filters)
+        if where:
+            q = q.where(where)
+        return q.limit(top_k).to_list()
+
+
+def create_index(
+    backend: str | None,
+    *,
+    dimensions: int | None = None,
+    api_key: str | None = None,
+    index_dir: Path | str | None = None,
+    namespace: str = CHUNKS_NAMESPACE,
+) -> LanceIndex | Index:
+    """Open the configured backend behind one surface.
+
+    ``local``/``lancedb`` -> :class:`LanceIndex` (embedded); ``turbopuffer`` ->
+    :class:`Index` (hosted fallback).  The rest of ``reader`` never learns which.
+    """
+    name = (backend or DEFAULT_BACKEND).lower()
+    if name in LOCAL_BACKENDS:
+        if index_dir is None:
+            raise ValueError("index_dir is required for the local (LanceDB) backend")
+        return LanceIndex(index_dir, dimensions, table=namespace)
+    if name == TURBOPUFFER_BACKEND:
+        return Index(api_key, dimensions, namespace)
+    raise ValueError(f"unknown INDEX_BACKEND: {backend!r}")

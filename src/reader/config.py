@@ -25,6 +25,7 @@ class Config:
     litellm_base_url: str
     litellm_master_key: str | None
     turbopuffer_api_key: str | None
+    index_backend: str = "lancedb"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Config:
@@ -35,6 +36,7 @@ class Config:
             litellm_base_url=e.get("LITELLM_BASE_URL", DEFAULT_GATEWAY_URL).rstrip("/"),
             litellm_master_key=e.get("LITELLM_MASTER_KEY") or None,
             turbopuffer_api_key=e.get("TURBOPUFFER_API_KEY") or None,
+            index_backend=e.get("INDEX_BACKEND", "lancedb"),
         )
 
     # --- derived paths ------------------------------------------------------
@@ -47,6 +49,11 @@ class Config:
     def images_dir(self) -> Path:
         """Content-addressed blob store root."""
         return self.data_dir / "images"
+
+    @property
+    def index_dir(self) -> Path:
+        """Local derived index (LanceDB) directory."""
+        return self.data_dir / "index"
 
     def image_path(self, sha256: str, ext: str) -> Path:
         """``images/<sha256[0:2]>/<sha256>.<ext>`` for a content hash."""

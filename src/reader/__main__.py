@@ -236,7 +236,12 @@ def cmd_embed(config: Config, args: argparse.Namespace) -> int:
                 "embedding dimensionality is not pinned; run `reader eval --pin N` first"
             )
         client = EmbedClient(config.litellm_base_url, config.litellm_master_key, model, dimensions)
-        idx = index_mod.Index(config.turbopuffer_api_key, dimensions)
+        idx = index_mod.create_index(
+            config.index_backend,
+            dimensions=dimensions,
+            api_key=config.turbopuffer_api_key,
+            index_dir=config.index_dir,
+        )
         rows: list[dict] = []
 
         chunks = store.chunks_to_embed(model)
@@ -269,7 +274,7 @@ def cmd_embed(config: Config, args: argparse.Namespace) -> int:
 
         if rows and not args.dry_run:
             idx.upsert(rows)
-            print(f"upserted {len(rows)} row(s) to Turbopuffer")
+            print(f"upserted {len(rows)} row(s) to {config.index_backend} index")
         elif rows:
             print(f"[dry-run] would upsert {len(rows)} row(s)")
         else:
@@ -281,6 +286,26 @@ def cmd_reembed(config: Config, args: argparse.Namespace) -> int:
     # Re-embedding is just `embed` under a new model; provenance columns make
     # the work queue scope itself to the new model.
     return cmd_embed(config, args)
+
+
+def cmd_index(config: Config, args: argparse.Namespace) -> int:
+    """Index maintenance (the local backend's housekeeping verb)."""
+    with open_store(config) as store, recorded(store, "index"):
+        cfg = store.get_embedding_config()
+        dimensions = cfg["embedding_dimensions"] if cfg else None
+        idx = index_mod.create_index(
+            config.index_backend,
+            dimensions=dimensions,
+            api_key=config.turbopuffer_api_key,
+            index_dir=config.index_dir,
+        )
+        if isinstance(idx, index_mod.LanceIndex):
+            if args.optimize:
+                idx.optimize(args.cleanup_older_than_days)
+            print(f"backend={config.index_backend} table={idx.table_name} rows={idx.count()}")
+        else:
+            print(f"backend={config.index_backend} (no local maintenance)")
+    return 0
 
 
 def cmd_eval(config: Config, args: argparse.Namespace) -> int:
@@ -305,7 +330,12 @@ def cmd_eval(config: Config, args: argparse.Namespace) -> int:
     with open_store(config) as store:
         cfg = store.get_embedding_config()
         dimensions = cfg["embedding_dimensions"] if cfg else None
-        idx = index_mod.Index(config.turbopuffer_api_key, dimensions)
+        idx = index_mod.create_index(
+            config.index_backend,
+            dimensions=dimensions,
+            api_key=config.turbopuffer_api_key,
+            index_dir=config.index_dir,
+        )
         for model in models:
             try:
                 client = EmbedClient(
@@ -377,6 +407,11 @@ def build_parser() -> argparse.ArgumentParser:
     re.add_argument("--dimensions", type=int, default=None)
     re.add_argument("--dry-run", action="store_true")
     re.set_defaults(func=cmd_reembed)
+
+    ix = sub.add_parser("index", help="index maintenance: build, optimize, stats")
+    ix.add_argument("--optimize", action="store_true", help="compact versions + rebuild indices")
+    ix.add_argument("--cleanup-older-than-days", type=int, default=None)
+    ix.set_defaults(func=cmd_index)
 
     return p
 
