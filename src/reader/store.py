@@ -252,11 +252,12 @@ class Store:
 
     # --- concepts -----------------------------------------------------------
 
-    def ensure_concept(self, name: str, type_: str = "term") -> int:
+    def ensure_concept(self, name: str, type_: str = "term", description: str | None = None) -> int:
         self.conn.execute(
-            "INSERT INTO concept (name, type) VALUES (?, ?) "
-            "ON CONFLICT(name, type) DO NOTHING",
-            (name, type_),
+            "INSERT INTO concept (name, type, description) VALUES (?, ?, ?) "
+            "ON CONFLICT(name, type) DO UPDATE SET "
+            "description = COALESCE(concept.description, excluded.description)",
+            (name, type_, description),
         )
         row = self.conn.execute(
             "SELECT id FROM concept WHERE name = ? AND type = ?", (name, type_)
@@ -396,7 +397,7 @@ class Store:
 
     def concepts_to_embed(self, model_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT id, name FROM concept "
+            "SELECT id, name, description FROM concept "
             "WHERE embed_model_id IS NULL OR embed_model_id != ? ORDER BY id",
             (model_id,),
         ).fetchall()

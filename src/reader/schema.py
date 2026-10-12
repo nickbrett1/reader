@@ -13,7 +13,7 @@ from __future__ import annotations
 
 #: Version of the SQLite schema.  ``gallery`` refuses to read a database whose
 #: recorded version does not match the one it was built against.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: Version of the extraction logic.  Stamped onto every ``document_page`` and
 #: ``image`` row so a re-extract can be scoped to rows produced by an older
@@ -196,5 +196,12 @@ MIGRATIONS: dict[int, str] = {
     CREATE INDEX IF NOT EXISTS idx_mention_concept ON concept_mention(concept_id);
     CREATE INDEX IF NOT EXISTS idx_mention_page ON concept_mention(page_id);
     CREATE INDEX IF NOT EXISTS idx_review_from ON concept_review(from_id);
+    """,
+    # v2 — a concept's optional description.  §6.2.2 embeds
+    # ``canonical_name + description``, not the bare name: a single short token
+    # is too flat a signal to place in the vector space (see the 2026-10-12
+    # calibration dry-run).
+    2: """
+    ALTER TABLE concept ADD COLUMN description TEXT;
     """,
 }

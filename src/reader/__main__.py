@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -187,6 +188,11 @@ def cmd_chunk(config: Config, args: argparse.Namespace) -> int:
 
 
 def cmd_concepts(config: Config, args: argparse.Namespace) -> int:
+    # LLM extraction (typed concepts + descriptions) when a model is named;
+    # otherwise the deterministic capitalised-phrase fallback.  The LLM pass is
+    # what makes the §6.2.2 dedup type gate meaningful (§12.14: gate to
+    # DeepSeek off-peak downstream, in dagu).
+    model = args.llm_model or os.environ.get("READER_CONCEPT_MODEL")
     with open_store(config) as store, recorded(store, "concepts"):
         books = store.conn.execute("SELECT id, work_key FROM book ORDER BY id").fetchall()
         created = 0
@@ -196,11 +202,20 @@ def cmd_concepts(config: Config, args: argparse.Namespace) -> int:
                 (b["id"],),
             ).fetchall()
             full_text = "\n".join(p["text"] for p in pages)
+            llm = None
+            if model:
+                known = [
+                    r["name"]
+                    for r in store.conn.execute("SELECT DISTINCT name FROM concept ORDER BY name")
+                ]
+                llm = concepts_mod.gateway_concept_llm(
+                    config.litellm_base_url, config.litellm_master_key, model, known=known
+                )
             candidates = concepts_mod.extract_book_concepts(
-                full_text, book_id=b["id"], limit=args.limit or 40
+                full_text, llm=llm, book_id=b["id"], limit=args.limit or 40
             )
             for c in candidates:
-                cid = store.ensure_concept(c.name, c.type)
+                cid = store.ensure_concept(c.name, c.type, c.description or None)
                 for surface, start, end in concepts_mod.surface_pass(c, full_text):
                     sid = store.add_surface(cid, surface)
                     # Re-anchor the mention to the page that contains the offset.
@@ -255,12 +270,17 @@ def cmd_embed(config: Config, args: argparse.Namespace) -> int:
 
         concepts = store.concepts_to_embed(model)
         if concepts:
-            res = client.embed_texts([c["name"] for c in concepts])
-            for c, vec in zip(concepts, res.vectors, strict=True):
+            # §6.2.2: embed canonical_name + description, not the bare name.
+            texts = [
+                f"{c['name']}. {c['description']}" if c["description"] else c["name"]
+                for c in concepts
+            ]
+            res = client.embed_texts(texts)
+            for c, vec, text in zip(concepts, res.vectors, texts, strict=True):
                 store.stamp_concept_embedding(
                     c["id"], res.model, res.dimensions, res.provenance()["embed_config_version"]
                 )
-                rows.append(index_mod.concept_row(c["id"], vec, c["name"]))
+                rows.append(index_mod.concept_row(c["id"], vec, text))
 
         images = store.images_to_embed(model)
         if images:
@@ -406,6 +426,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     k = sub.add_parser("concepts", help="per-book + surface + merge passes")
     k.add_argument("--limit", type=int, default=0)
+    k.add_argument(
+        "--llm-model",
+        default=None,
+        help="gateway chat model for extraction (default $READER_CONCEPT_MODEL; "
+        "absent -> deterministic heuristic)",
+    )
     k.add_argument("--rebuild-derived", action="store_true")
     k.set_defaults(func=cmd_concepts)
 

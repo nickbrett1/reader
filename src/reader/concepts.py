@@ -17,10 +17,13 @@ books into one node.
 
 from __future__ import annotations
 
+import json
 import math
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
+
+import httpx
 
 _WORD = re.compile(r"[A-Za-z][A-Za-z'\-]+")
 _CAP_PHRASE = re.compile(r"\b([A-Z][a-zA-Z]{2,}(?:\s+[A-Z][a-zA-Z]{2,}){0,3})\b")
@@ -28,6 +31,16 @@ _STOP = {
     "the", "and", "for", "with", "that", "this", "from", "into", "when", "then",
     "they", "their", "there", "which", "while", "would", "could", "should",
     "chapter", "page", "figure", "table", "one", "two", "three",
+    # Pronouns / determiners / conjunctions that the capitalised-phrase
+    # heuristic otherwise mistakes for concepts (see the 2026-10-12 calibration
+    # dry-run: "You", "She", "But", "What", "His", …).
+    "he", "she", "it", "we", "you", "him", "her", "his", "its", "our",
+    "your", "them", "us", "me", "my", "mine", "who", "whom", "whose",
+    "what", "where", "why", "how", "but", "or", "so",
+    "yet", "nor", "if", "as", "at", "by", "of", "on", "to", "in", "an", "a",
+    "all", "any", "each", "both", "some", "such", "no", "not", "only", "own",
+    "same", "than", "too", "very", "just", "after", "before", "again",
+    "another", "these", "those", "here", "now", "off", "out", "over", "under",
 }
 
 
@@ -35,9 +48,18 @@ _STOP = {
 class ConceptCandidate:
     name: str
     type: str = "term"
+    description: str = ""
     surfaces: list[str] = field(default_factory=list)
     confidence: float = 0.0
     book_id: int | None = None
+
+    def embed_text(self) -> str:
+        """The text embedded for the dedup detector: ``name + description``.
+
+        §6.2.2 embeds ``canonical_name + description``; a bare one-word name is
+        too flat a signal (2026-10-12 calibration dry-run).
+        """
+        return f"{self.name}. {self.description}".strip(" .") if self.description else self.name
 
 
 def normalize(s: str) -> str:
@@ -73,10 +95,76 @@ def parse_llm_concepts(payload: object) -> list[ConceptCandidate]:
                 ConceptCandidate(
                     name=str(row["name"]),
                     type=str(row.get("type", "term")),
+                    description=str(row.get("description", "") or ""),
                     confidence=float(row.get("confidence", 0.0) or 0.0),
                 )
             )
     return out
+
+
+#: The prompt asks for typed concepts with a one-line description; the type
+#: vocabulary is open but seeded so the type gate (§6.2.2) has something to use.
+_CONCEPT_PROMPT = (
+    "Extract the notable concepts from this video-game book's text. A concept "
+    "is a character, place, item, organisation, franchise, creature, event or "
+    "recurring idea — not a pronoun, determiner or common word. For each, "
+    "return an object with: name (short canonical form), type (one of "
+    "character, place, item, organisation, franchise, creature, event, "
+    "concept), description (one clause describing it in this book), "
+    "confidence (0-1). Return a JSON array only. Where a thing is already in "
+    "the known list below, reuse that exact name. Known so far: {known}\n\n"
+    "TEXT:\n{text}"
+)
+
+
+def gateway_concept_llm(
+    base_url: str,
+    api_key: str | None,
+    model: str,
+    *,
+    timeout: float = 300.0,
+    known: Sequence[str] = (),
+) -> Callable[[str], object]:
+    """Build an ``llm`` callable that extracts concepts via the LiteLLM gateway.
+
+    The returned callable POSTs a chat completion to ``{base_url}/v1/chat/completions``
+    and returns the parsed JSON array.  Kept as a callable so
+    :func:`extract_book_concepts` stays transport-free and testable.
+    """
+    def _call(text: str) -> object:
+        prompt = _CONCEPT_PROMPT.format(known=", ".join(known) or "(none)", text=text)
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        resp = httpx.post(
+            f"{base_url.rstrip('/')}/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0,
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        content = resp.json()["choices"][0]["message"]["content"]
+        return _parse_json_array(content)
+
+    return _call
+
+
+def _parse_json_array(content: str) -> object:
+    """Parse a JSON array out of an LLM reply, tolerating code fences/prose."""
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.split("```", 2)[1]
+        if text.startswith("json"):
+            text = text[4:]
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end == -1:
+        return []
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return []
 
 
 def extract_book_concepts(
