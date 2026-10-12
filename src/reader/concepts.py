@@ -25,7 +25,10 @@ from dataclasses import dataclass, field
 
 import httpx
 
-_WORD = re.compile(r"[A-Za-z][A-Za-z'\-]+")
+#: A word token: alphanumeric, may carry apostrophes/hyphens.  Numeric tokens
+#: are kept so numbered franchise sequels do not collapse onto their parent
+#: ("Resident Evil" vs "Resident Evil 2" — the 2026-10-12 full-corpus run).
+_WORD = re.compile(r"[A-Za-z0-9]+(?:['\-][A-Za-z0-9]+)*")
 _CAP_PHRASE = re.compile(r"\b([A-Z][a-zA-Z]{2,}(?:\s+[A-Z][a-zA-Z]{2,}){0,3})\b")
 _STOP = {
     "the", "and", "for", "with", "that", "this", "from", "into", "when", "then",

@@ -91,3 +91,12 @@ def test_concepts_to_embed_selects_description(tmp_path):
         row = store.concepts_to_embed("cohere/embed-v5.0")[0]
         assert row["name"] == "Dormin" and row["description"] == "an ancient entity"
         assert json.dumps(dict(row))  # row is mapping-like
+
+
+def test_lexical_keeps_digits_so_sequels_are_not_identical():
+    # "Resident Evil" must not token-match "Resident Evil 2" at 1.0 (digit was
+    # dropped before the 2026-10-12 full-corpus calibration).
+    assert concepts.lexical_similarity("Resident Evil", "Resident Evil 2") < 1.0
+    assert concepts.lexical_similarity("The Witcher", "The Witcher 3") < 1.0
+    # A true variant (same tokens) still scores 1.0.
+    assert concepts.lexical_similarity("Resident Evil", "resident evil") == 1.0
