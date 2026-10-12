@@ -266,7 +266,11 @@ def cmd_embed(config: Config, args: argparse.Namespace) -> int:
                 store.stamp_chunk_embedding(
                     c["id"], res.model, res.dimensions, res.provenance()["embed_config_version"]
                 )
-                rows.append(index_mod.text_row(c["id"], vec, c["text"]))
+                rows.append(
+                    index_mod.text_row(
+                        c["id"], vec, c["text"], book_id=c["book_id"], page_id=c["page_id"]
+                    )
+                )
 
         concepts = store.concepts_to_embed(model)
         if concepts:
@@ -290,7 +294,11 @@ def cmd_embed(config: Config, args: argparse.Namespace) -> int:
                 store.stamp_image_embedding(
                     im["id"], res.model, res.dimensions, res.provenance()["embed_config_version"]
                 )
-                rows.append(index_mod.image_row(im["id"], vec))
+                rows.append(
+                    index_mod.image_row(
+                        im["id"], vec, book_id=im["book_id"], page_id=im["page_id"]
+                    )
+                )
 
         if rows and not args.dry_run:
             idx.upsert(rows)

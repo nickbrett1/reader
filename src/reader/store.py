@@ -382,16 +382,22 @@ class Store:
         self.conn.commit()
 
     def chunks_to_embed(self, model_id: str) -> list[sqlite3.Row]:
+        # Carry the page/book columns the index stores, so a query can scope by
+        # book_id/page_id without a round-trip to SQLite.
         return self.conn.execute(
-            "SELECT id, text FROM chunk "
-            "WHERE embed_model_id IS NULL OR embed_model_id != ? ORDER BY id",
+            "SELECT c.id, c.text, c.page_id, p.book_id FROM chunk c "
+            "JOIN document_page p ON p.id = c.page_id "
+            "WHERE c.embed_model_id IS NULL OR c.embed_model_id != ? ORDER BY c.id",
             (model_id,),
         ).fetchall()
 
     def images_to_embed(self, model_id: str) -> list[sqlite3.Row]:
+        # image.page_no maps to a document_page, so resolve page_id when the
+        # book is known; book_id/page_id stay NULL when the book is unknown.
         return self.conn.execute(
-            "SELECT id, path, mime FROM image "
-            "WHERE embed_model_id IS NULL OR embed_model_id != ? ORDER BY id",
+            "SELECT i.id, i.path, i.mime, i.book_id, p.id AS page_id FROM image i "
+            "LEFT JOIN document_page p ON p.book_id = i.book_id AND p.page_no = i.page_no "
+            "WHERE i.embed_model_id IS NULL OR i.embed_model_id != ? ORDER BY i.id",
             (model_id,),
         ).fetchall()
 

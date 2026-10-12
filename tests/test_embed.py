@@ -50,6 +50,25 @@ def test_split_batches_by_bytes():
     assert [len(b) for b in batches] == [2, 2]
 
 
+def test_split_batches_by_pixels():
+    import io
+
+    from PIL import Image
+
+    def make_png(w: int, h: int) -> bytes:
+        img = Image.new("RGB", (w, h), color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+    # 3 images: 1000x1000 (1MP each)
+    p1 = make_png(1000, 1000)
+    items = [ImageInput("image/png", p1) for _ in range(3)]
+    # Cap at 2.5 MP: should yield [2, 1] batches
+    batches = split_batches(items, max_batch=100, max_bytes=10**9, max_pixels=2_500_000)
+    assert [len(b) for b in batches] == [2, 1]
+
+
 def test_embed_texts_orders_by_index_and_wraps_images():
     calls = []
 

@@ -72,6 +72,54 @@ def test_embedding_provenance_scopes_the_queue(tmp_path):
         s.close()
 
 
+def test_embed_selectors_carry_book_and_page(tmp_path):
+    """chunk/image embed queues must carry book_id/page_id for the index rows."""
+    s = _store(tmp_path)
+    try:
+        bid = s.upsert_book("w", "epub", "w.epub", "sha")
+        pid = s.upsert_page(bid, 3, "hello world", "sha")
+        s.set_chunks(pid, [(0, 0, 11, "hello world")])
+        [c] = s.chunks_to_embed("m")
+        assert c["book_id"] == bid
+        assert c["page_id"] == pid
+
+        img = s.upsert_image(
+            "imgsha", "/x.bin", "image/png", 3, "embedded", "sha",
+            book_id=bid, page_no=3,
+        )
+        [im] = s.images_to_embed("m")
+        assert im["book_id"] == bid
+        assert im["page_id"] == pid  # page_no 3 resolves to the page
+
+        # A book-less image keeps NULL book_id/page_id rather than inventing them.
+        s.upsert_image("imgsha2", "/y.bin", "image/png", 3, "embedded", "sha")
+        orphan = [r for r in s.images_to_embed("m") if r["id"] != img][0]
+        assert orphan["book_id"] is None
+        assert orphan["page_id"] is None
+    finally:
+        s.close()
+
+
+def test_rebuild_rows_carry_book_and_page(tmp_path):
+    import reader.index as index_mod
+
+    s = _store(tmp_path)
+    try:
+        bid = s.upsert_book("w", "epub", "w.epub", "sha")
+        pid = s.upsert_page(bid, 0, "hello", "sha")
+        s.set_chunks(pid, [(0, 0, 5, "hello")])
+        rows = index_mod.rebuild_rows(
+            s,
+            embed_text=lambda texts: [[0.0, 1.0] for _ in texts],
+            embed_images=lambda imgs: [[0.0, 1.0] for _ in imgs],
+        )
+        [text_row_] = [r for r in rows if r["kind"] == "text"]
+        assert text_row_["book_id"] == bid
+        assert text_row_["page_id"] == pid
+    finally:
+        s.close()
+
+
 def test_concept_review_log_is_append_only_and_derived(tmp_path):
     s = _store(tmp_path)
     try:

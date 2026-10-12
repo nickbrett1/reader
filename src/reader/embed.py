@@ -28,6 +28,10 @@ from typing import Any
 
 from .schema import COHERE_IMAGE_USD_PER_MTOK, EMBED_CONFIG_VERSION
 
+#: Cohere / gateway hard limit is 50,000,000 decoded pixels per batch.
+#: We cap at 40 MP to keep a comfortable safety margin.
+MAX_IMAGE_PIXELS_PER_BATCH = 40_000_000
+
 
 class MixedModalityError(ValueError):
     """Raised when one ``input`` array would mix text and image."""
@@ -83,22 +87,45 @@ def _item_payload_size(item: Input) -> int:
     return len(item.text) if isinstance(item, TextInput) else len(item.data)
 
 
+def _item_pixels(item: Input) -> int:
+    """Decoded pixel count (w * h) for image inputs; 0 for text or invalid bytes."""
+    if not isinstance(item, ImageInput):
+        return 0
+    import io
+
+    from PIL import Image
+
+    try:
+        with Image.open(io.BytesIO(item.data)) as im:
+            return int(im.width * im.height)
+    except Exception:
+        return 0
+
+
 def split_batches(
     items: Sequence[Input],
     max_batch: int = 64,
     max_bytes: int = 16 * 1024 * 1024,
+    max_pixels: int | None = None,
 ) -> list[list[Input]]:
-    """Split into gateway-sized batches by count and by payload bytes."""
+    """Split into gateway-sized batches by count, payload bytes, and decoded pixels."""
     batches: list[list[Input]] = []
     cur: list[Input] = []
     cur_bytes = 0
+    cur_pixels = 0
     for item in items:
         size = _item_payload_size(item)
-        if cur and (len(cur) >= max_batch or cur_bytes + size > max_bytes):
+        pixels = _item_pixels(item) if max_pixels is not None else 0
+        if cur and (
+            len(cur) >= max_batch
+            or cur_bytes + size > max_bytes
+            or (max_pixels is not None and cur_pixels + pixels > max_pixels)
+        ):
             batches.append(cur)
-            cur, cur_bytes = [], 0
+            cur, cur_bytes, cur_pixels = [], 0, 0
         cur.append(item)
         cur_bytes += size
+        cur_pixels += pixels
     if cur:
         batches.append(cur)
     return batches
@@ -117,6 +144,7 @@ class EmbedClient:
         timeout: float = 60.0,
         max_batch: int = 64,
         max_bytes: int = 16 * 1024 * 1024,
+        max_pixels: int | None = MAX_IMAGE_PIXELS_PER_BATCH,
         http: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -126,6 +154,7 @@ class EmbedClient:
         self.timeout = timeout
         self.max_batch = max_batch
         self.max_bytes = max_bytes
+        self.max_pixels = max_pixels
         #: Injectable transport for tests; when None, httpx is used.
         self._http = http
 
@@ -146,7 +175,10 @@ class EmbedClient:
         vectors: list[list[float]] = []
         usage: dict[str, Any] = {}
         dims = self.dimensions or 0
-        for batch in split_batches(items, self.max_batch, self.max_bytes):
+        pix_limit = self.max_pixels if images else None
+        for batch in split_batches(
+            items, self.max_batch, self.max_bytes, max_pixels=pix_limit
+        ):
             payload = [self._to_input(i) for i in batch]
             resp = self._post({"model": self.model, "input": payload})
             data = resp.get("data")

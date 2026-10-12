@@ -171,12 +171,14 @@ def rebuild_rows(
     rows: list[dict[str, Any]] = []
 
     chunks = conn.execute(
-        "SELECT id, text FROM chunk ORDER BY id" + (f" LIMIT {int(limit)}" if limit else "")
+        "SELECT c.id, c.text, c.page_id, p.book_id FROM chunk c "
+        "JOIN document_page p ON p.id = c.page_id ORDER BY c.id"
+        + (f" LIMIT {int(limit)}" if limit else "")
     ).fetchall()
     if chunks:
         vecs = embed_text([c["text"] for c in chunks])
         for c, v in zip(chunks, vecs, strict=True):
-            rows.append(text_row(c["id"], v, c["text"]))
+            rows.append(text_row(c["id"], v, c["text"], book_id=c["book_id"], page_id=c["page_id"]))
 
     concepts = conn.execute(
         "SELECT id, name FROM concept ORDER BY id"
@@ -188,8 +190,9 @@ def rebuild_rows(
             rows.append(concept_row(c["id"], v, c["name"]))
 
     images = conn.execute(
-        "SELECT id, path, mime FROM image ORDER BY id"
-        + (f" LIMIT {int(limit)}" if limit else "")
+        "SELECT i.id, i.path, i.mime, i.book_id, p.id AS page_id FROM image i "
+        "LEFT JOIN document_page p ON p.book_id = i.book_id AND p.page_no = i.page_no "
+        "ORDER BY i.id" + (f" LIMIT {int(limit)}" if limit else "")
     ).fetchall()
     if images:
         payload: list[tuple[str, bytes]] = []
@@ -197,7 +200,7 @@ def rebuild_rows(
             payload.append((im["mime"], _read_blob(im["path"])))
         vecs = embed_images(payload)
         for im, v in zip(images, vecs, strict=True):
-            rows.append(image_row(im["id"], v))
+            rows.append(image_row(im["id"], v, book_id=im["book_id"], page_id=im["page_id"]))
 
     return rows
 
