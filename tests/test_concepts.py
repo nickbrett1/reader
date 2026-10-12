@@ -100,3 +100,31 @@ def test_lexical_keeps_digits_so_sequels_are_not_identical():
     assert concepts.lexical_similarity("The Witcher", "The Witcher 3") < 1.0
     # A true variant (same tokens) still scores 1.0.
     assert concepts.lexical_similarity("Resident Evil", "resident evil") == 1.0
+
+
+def test_franchise_distinct_only_fires_on_differing_markers():
+    # Different entry of the same franchise -> distinct.
+    assert concepts.franchise_distinct("Resident Evil", "Resident Evil 2")
+    assert concepts.franchise_distinct("Halo", "Halo 3")
+    assert concepts.franchise_distinct("Final Fantasy VII", "Final Fantasy VIII")
+    # Same marker written differently (roman vs arabic) -> NOT distinct.
+    assert not concepts.franchise_distinct("Final Fantasy VII", "Final Fantasy 7")
+    # Identical names -> not distinct.
+    assert not concepts.franchise_distinct("Resident Evil", "resident evil")
+    # Different base tokens (true synonyms) -> not distinct, pair still allowed.
+    assert not concepts.franchise_distinct("Resident Evil", "Biohazard")
+
+
+def test_candidate_pairs_drops_franchise_sequels_but_keeps_same_name():
+    c = concepts.ConceptCandidate
+    concepts_list = [
+        c("Resident Evil", "franchise"),
+        c("Resident Evil 2", "franchise"),
+        c("resident evil", "franchise"),       # same entry, different casing
+    ]
+    pairs = concepts.candidate_pairs(concepts_list, lexical_threshold=0.5)
+    got = {(p.i, p.j) for p in pairs}
+    # Resident Evil <-> Resident Evil 2 is suppressed as a franchise pair.
+    assert (0, 1) not in got
+    # The same entry (identical tokens, no numeral) survives the franchise gate.
+    assert (0, 2) in got

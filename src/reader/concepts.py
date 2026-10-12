@@ -241,6 +241,49 @@ def lexical_similarity(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
+#: Roman numerals that commonly mark a franchise entry (I…XX).
+_ROMAN = {
+    "i": 1, "ii": 2, "iii": 3, "iv": 4, "v": 5, "vi": 6, "vii": 7, "viii": 8,
+    "ix": 9, "x": 10, "xi": 11, "xii": 12, "xiii": 13, "xiv": 14, "xv": 15,
+    "xvi": 16, "xvii": 17, "xviii": 18, "xix": 19, "xx": 20,
+}
+
+
+def _split_numeral(name: str) -> tuple[tuple[str, ...], int | None]:
+    """Split a name into (base tokens, trailing numeral value).
+
+    A trailing arabic ("2") or roman ("VII") token is read as a franchise
+    marker; its value is returned and the token removed from the base.
+    """
+    toks = tuple(t.lower() for t in _WORD.findall(normalize(name)))
+    if not toks:
+        return toks, None
+    last = toks[-1]
+    if last.isdigit():
+        return toks[:-1], int(last)
+    if last in _ROMAN:
+        return toks[:-1], _ROMAN[last]
+    return toks, None
+
+
+def franchise_distinct(a: str, b: str) -> bool:
+    """True when ``a`` and ``b`` name *different entries* of the same franchise.
+
+    "Resident Evil" vs "Resident Evil 2", "Halo" vs "Halo 3": they share every
+    non-numeral token but differ by a sequel marker, so they are distinct
+    concepts and must not be offered as a merge candidate. The 2026-10-12
+    full-corpus run showed franchise granularity is the dominant false-positive
+    class, and a similarity cut wide enough to admit true synonyms
+    ("Resident Evil" ~ "Biohazard") also admits these.
+    """
+    base_a, num_a = _split_numeral(a)
+    base_b, num_b = _split_numeral(b)
+    if base_a != base_b:
+        return False
+    # Same base tokens: distinct only when the franchise markers differ.
+    return num_a != num_b
+
+
 def cosine(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b, strict=False))
     na = math.sqrt(sum(x * x for x in a)) or 1.0
@@ -266,7 +309,9 @@ def candidate_pairs(
     """Lexical + ANN dedup candidates, gated on matching ``type``.
 
     ``type`` is a hard gate: two concepts of different types are never a merge
-    candidate regardless of how similar their names are.
+    candidate regardless of how similar their names are. A second gate drops
+    *franchise* pairs — names that differ only by a sequel numeral — unless the
+    numerals are equal (:func:`franchise_distinct`).
     """
     if embeddings is None and embed_fn is not None:
         embeddings = [embed_fn(c.name) for c in concepts]
@@ -276,6 +321,10 @@ def candidate_pairs(
     for i in range(n):
         for j in range(i + 1, n):
             if concepts[i].type != concepts[j].type:
+                continue
+            # Franchise granularity: "Resident Evil" vs "Resident Evil 2" share a
+            # token set but are different entries, not a merge (2026-10-12 run).
+            if franchise_distinct(concepts[i].name, concepts[j].name):
                 continue
             reasons = []
             score = 0.0
