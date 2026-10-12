@@ -21,7 +21,9 @@ Thumbs.db
 # Antigravity
 .antigravitycli
 
-# Optional
+# Local staging corpus (never commit book files)
+.ingest/
+
 
 
 # Python
@@ -35,3 +37,6 @@ venv/
 
 
 
+
+# Local SQLite/blob output (never commit)
+.reader-data/
