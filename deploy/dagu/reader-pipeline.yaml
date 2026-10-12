@@ -1,0 +1,45 @@
+# reader ingestion pipeline — scheduled on the NAS by dagu.
+#
+# Steps mirror the CLI order:
+#   manifest -> extract -> images -> chunk -> concepts -> embed -> index
+#
+# The `concepts` step runs an LLM (the typed-concept extraction pass); it is
+# gated to DeepSeek's OFF-PEAK pricing window via a precondition, so the pass is
+# billed at the half rate. See scripts/deepseek_offpeak.py for the window.
+#
+# Install: copy this file into the dagu DAGs directory on the NAS, then verify in
+# the dagu UI (port 3006) or with `dagu status reader-pipeline`:
+#   scp deploy/dagu/reader-pipeline.yaml <nas>:/volume1/docker/dagu/dags/
+#
+# The container must have READER_INGEST (the staging tree) and READER_DATA (the
+# SQLite + LanceDB record) set, plus LITELLM_BASE_URL / LITELLM_MASTER_KEY.
+
+schedule: "30 10 * * *" # 10:30 UTC daily — outside both peak bands (01:00-04:00, 06:00-10:00)
+
+steps:
+  - name: manifest
+    command: reader manifest --commit
+
+  - name: extract
+    command: reader extract
+
+  - name: images
+    command: reader images
+
+  - name: chunk
+    command: reader chunk
+
+  # LLM pass: DeepSeek off-peak only. `deepseek-flash` is the canonical cheap
+  # model name (api-docs.deepseek.com); the step is deferred, not failed, when
+  # the precondition says it is currently peak.
+  - name: concepts
+    command: reader concepts --llm-model deepseek-flash
+    preconditions:
+      - condition: "python3 scripts/deepseek_offpeak.py"
+        expected: "off-peak"
+
+  - name: embed
+    command: reader embed
+
+  - name: index-optimize
+    command: reader index --optimize
