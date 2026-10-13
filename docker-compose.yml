@@ -35,8 +35,10 @@ services:
       TURBOPUFFER_API_KEY: ${TURBOPUFFER_API_KEY}
       READER_INGEST: ${READER_INGEST:-/ingest}
       READER_DATA: ${READER_DATA:-/data}
-    # If `nas` does not resolve on the bridge network, uncomment and set the IP:
-    # extra_hosts:
-    #   - "nas:192.168.1.x"
+    # `nas` does NOT resolve on the bridge network (verified 2026-10-13), so pin
+    # it to the primary NAS IP. Keeps the default LITELLM_BASE_URL
+    # (http://nas:4000) working. Update if the NAS IP changes.
+    extra_hosts:
+      - "nas:192.168.1.2"
     labels:
       - "com.centurylinklabs.watchtower.enable=true"
