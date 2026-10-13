@@ -32,7 +32,39 @@ text chunks; pro == fast tie at recall@10 = 0.357 over 15 labels).
 ## Running log
 
 - _00:20Z_ — note opened; inspecting current DB state before the pull.
+- _00:26Z_ — pull done via the nas-goose relay (`python3 -m http.server 8099`):
+  BG3 301 586 309 (sha256 4b68866c…), NP_Arcade 101 830 336 (b7c7abaf…),
+  079b3a 353 272 478 (b1c104ce…). Relay killed.
+- _00:28–00:40Z_ — manifest/extract/chunk/images for the 3 new books (42–44).
+  Images: book 42 = 691 unique (851 raw), 43 = 1073 (1422 raw), 44 = 618
+  (1098 raw) → 2 382 new image rows, **0 embedded**.
+  Text: +1 174 chunks (total 24 554); pages: 236/97/162.
+- _00:22–00:57Z_ — a **fast** re-embed (`reembed --model cohere/embed-v5.0-fast`)
+  ran concurrently and **FAILED**: `gateway request failed: timed out`
+  (httpx.ReadTimeout) during the IMAGE phase. It had already stamped all
+  23 380 old chunks fast in SQLite, but `cmd_embed` only upserts the Lance index
+  at the very end — so the run aborted **before** any index write. Net effect:
+  SQLite provenance said "fast" while the Lance index still held **pro** vectors.
+- _00:58Z_ — chained confirm eval printed `cohere/embed-v5.0-fast:
+  recall@10 = 0.357 over 15 queries` (query-side only; corpus vectors were still pro).
+
+## Fixes applied
+
+- **`4ca1525`** — `EmbedClient` timeout 60 s → **180 s** + retry (×2, backoff) on
+  transient `Timeout`/`Transport` errors; definite HTTP status errors still fail
+  fast. Regression test: `test_post_retries_transient_timeout_then_succeeds`.
+- Cleared provenance (`embed_model_id/dimensions/embed_config_version/embedded_at
+  = NULL`) on chunk (24 554), image (3 063), concept (56) so the index is rebuilt
+  **in fast**, not left as pro.
 
 ## Resume here / status
 
-🟡 **IN PROGRESS** — see "Running log" above for the last completed stage.
+🟡 **IN PROGRESS** — recovery run launched _00:59Z_: `reader embed
+--model cohere/embed-v5.0-fast --dimensions 2048` → `index --optimize` → `eval`,
+chained, to `/tmp/reembed-fast2.log`. Expect ~27 673 index rows.
+
+**Still to do after it lands:** the DeepSeek concept pass for books 42–44
+(`reader concepts --llm-model deepseek-flash --books 42,43,44` — the `--books`
+flag is uncommitted in `src/reader/__main__.py`), gated to off-peak
+(01:00–04:00 / 06:00–10:00 UTC are peak). Then re-run the eval to include
+concepts.
