@@ -33,7 +33,7 @@ from .store import Store
 
 #: Default embedding model id (Cohere via the gateway).  ``eval`` decides
 #: pro-vs-fast; ``reembed --model`` overrides either.
-DEFAULT_MODEL = "cohere/embed-v5.0"
+DEFAULT_MODEL = "cohere/embed-v5.0-fast"  # pro==fast on recall (2026-10-12, 23k chunks); fast is cheaper
 EVAL_MODELS = (
     "cohere/embed-v5.0",
     "cohere/embed-v5.0-fast",
