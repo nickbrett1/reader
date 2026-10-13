@@ -81,3 +81,14 @@ def test_index_id_normalises_eval_labels():
     assert _index_id("12") == "text:12"
     assert _index_id("concept:3") == "concept:3"
     assert _index_id("image:7") == "image:7"
+
+
+def test_book_id_filter_parses_csv():
+    from reader.__main__ import _book_id_filter
+
+    # No filter -> None (every book is processed).
+    assert _book_id_filter(None) is None
+    assert _book_id_filter("") is None
+    # Comma-separated ids, tolerant of surrounding whitespace.
+    assert _book_id_filter("42,43,44") == {42, 43, 44}
+    assert _book_id_filter(" 7 , 9 ") == {7, 9}

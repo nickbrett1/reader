@@ -134,11 +134,28 @@ def cmd_extract(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _book_id_filter(value: object) -> set[int] | None:
+    """Parse a ``--books 39,40`` argument into a set of book ids (or None)."""
+    if not value:
+        return None
+    return {int(x) for x in str(value).split(",") if x.strip()}
+
+
 def cmd_images(config: Config, args: argparse.Namespace) -> int:
     works = manifest_mod.build(config.ingest_dir)
     if args.limit:
         works = works[: args.limit]
+    only = _book_id_filter(getattr(args, "books", None))
     with open_store(config) as store, recorded(store, "images"):
+        if only is not None:
+            qmarks = ",".join("?" * len(only))
+            keys = {
+                r["work_key"]
+                for r in store.conn.execute(
+                    f"SELECT work_key FROM book WHERE id IN ({qmarks})", tuple(only)
+                )
+            }
+            works = [w for w in works if w.key in keys]
         total = 0
         for w in works:
             sf = _work_source(w)
@@ -193,8 +210,13 @@ def cmd_concepts(config: Config, args: argparse.Namespace) -> int:
     # what makes the §6.2.2 dedup type gate meaningful (§12.14: gate to
     # DeepSeek off-peak downstream, in dagu).
     model = args.llm_model or os.environ.get("READER_CONCEPT_MODEL")
+    only = None
+    if getattr(args, "books", None):
+        only = {int(x) for x in str(args.books).split(",") if x.strip()}
     with open_store(config) as store, recorded(store, "concepts"):
         books = store.conn.execute("SELECT id, work_key FROM book ORDER BY id").fetchall()
+        if only is not None:
+            books = [b for b in books if b["id"] in only]
         created = 0
         for b in books:
             pages = store.conn.execute(
@@ -436,6 +458,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     i = sub.add_parser("images", help="extract / render / dedupe images")
     i.add_argument("--limit", type=int, default=0)
+    i.add_argument(
+        "--books",
+        default=None,
+        help="comma-separated book ids to restrict the pass (default: all books)",
+    )
     i.set_defaults(func=cmd_images)
 
     c = sub.add_parser("chunk", help="cut page text into offset ranges")
@@ -444,6 +471,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     k = sub.add_parser("concepts", help="per-book + surface + merge passes")
     k.add_argument("--limit", type=int, default=0)
+    k.add_argument(
+        "--books",
+        default=None,
+        help="comma-separated book ids to restrict the pass (default: all books)",
+    )
     k.add_argument(
         "--llm-model",
         default=None,
