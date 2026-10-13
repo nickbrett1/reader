@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import re
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -228,10 +229,11 @@ class EmbedClient:
         model: str,
         dimensions: int | None = None,
         *,
-        timeout: float = 60.0,
+        timeout: float = 180.0,
         max_batch: int = 64,
         max_bytes: int = 16 * 1024 * 1024,
         max_pixels: int | None = MAX_IMAGE_PIXELS_PER_BATCH,
+        retries: int = 2,
         http: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -242,6 +244,11 @@ class EmbedClient:
         self.max_batch = max_batch
         self.max_bytes = max_bytes
         self.max_pixels = max_pixels
+        #: Retries per batch on a transient network/timeout error. The gateway
+        #: can be slow on heavy image batches; a single 60 s timeout must not
+        #: abort a multi-thousand-image embed (it did: see
+        #: reader-artbooks-ingest.md, 2026-10-13).
+        self.retries = retries
         #: Injectable transport for tests; when None, httpx is used.
         self._http = http
 
@@ -316,16 +323,29 @@ class EmbedClient:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        try:
-            r = httpx.post(
-                f"{self.base_url}/v1/embeddings",
-                json=payload,
-                headers=headers,
-                timeout=self.timeout,
-            )
-            r.raise_for_status()
-        except httpx.HTTPStatusError as exc:  # pragma: no cover - network path
-            raise EmbedError(f"gateway {exc.response.status_code}: {exc.response.text}") from exc
-        except httpx.HTTPError as exc:  # pragma: no cover - network path
-            raise EmbedError(f"gateway request failed: {exc}") from exc
-        return r.json()
+        last: Exception | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                r = httpx.post(
+                    f"{self.base_url}/v1/embeddings",
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+                r.raise_for_status()
+                return r.json()
+            except httpx.HTTPStatusError as exc:  # pragma: no cover - network path
+                # A definite gateway rejection: do not retry.
+                raise EmbedError(
+                    f"gateway {exc.response.status_code}: {exc.response.text}"
+                ) from exc
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                # Transient: retry with a short backoff.
+                last = exc
+                if attempt < self.retries:
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
+            except httpx.HTTPError as exc:  # pragma: no cover - network path
+                last = exc
+                break
+        raise EmbedError(f"gateway request failed: {last}") from last

@@ -187,3 +187,60 @@ def test_image_cost_at_list_rate():
     # 1M image tokens at $0.40/Mtok.
     assert image_cost_usd(1_000_000) == pytest.approx(0.40)
     assert image_cost_usd(0) == 0.0
+
+
+class _Resp:
+    def __init__(self, vectors):
+        self._vectors = vectors
+
+    def raise_for_status(self):  # noqa: D401 - stands in for httpx.Response
+        return None
+
+    def json(self):
+        return {
+            "data": [{"index": i, "embedding": v} for i, v in enumerate(self._vectors)]
+        }
+
+
+def test_post_retries_transient_timeout_then_succeeds(monkeypatch):
+    """A slow image batch must not abort the whole embed (2026-10-13 regression)."""
+    import httpx
+
+    import reader.embed as embed_mod
+
+    calls = {"n": 0}
+
+    def fake_post(url, *, json=None, headers=None, timeout=None):  # noqa: A002
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ReadTimeout("too slow")
+        return _Resp([[1.0, 2.0]])
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(embed_mod.time, "sleep", lambda *_: None)
+
+    client = EmbedClient("http://gw", "k", "m", retries=2)
+    res = client.embed_texts(["x"])
+    assert calls["n"] == 3
+    assert res.vectors == [[1.0, 2.0]]
+
+
+def test_post_raises_after_retries_exhausted(monkeypatch):
+    import httpx
+
+    import reader.embed as embed_mod
+    from reader.embed import EmbedError
+
+    calls = {"n": 0}
+
+    def fake_post(url, *, json=None, headers=None, timeout=None):  # noqa: A002
+        calls["n"] += 1
+        raise httpx.ReadTimeout("nope")
+
+    monkeypatch.setattr(httpx, "post", fake_post)
+    monkeypatch.setattr(embed_mod.time, "sleep", lambda *_: None)
+
+    client = EmbedClient("http://gw", "k", "m", retries=2)
+    with pytest.raises(EmbedError, match="gateway request failed"):
+        client.embed_texts(["x"])
+    assert calls["n"] == 3  # initial + 2 retries
