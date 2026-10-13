@@ -39,11 +39,11 @@ steps:
   - name: chunk
     command: docker exec reader reader chunk
 
-  # LLM pass: DeepSeek off-peak only. `deepseek-flash` is the canonical cheap
-  # model name (api-docs.deepseek.com); the step is deferred, not failed, when
-  # the precondition says it is currently peak.
+  # LLM pass: DeepSeek off-peak only. `deepseek-v4-flash` is the cheap model id
+  # exposed by the gateway (verify with `curl /v1/models`); the step is deferred,
+  # not failed, when the precondition says it is currently peak.
   - name: concepts
-    command: docker exec reader reader concepts --llm-model deepseek-flash
+    command: docker exec reader reader concepts --llm-model deepseek-v4-flash
     preconditions:
       - condition: "docker exec reader python3 scripts/deepseek_offpeak.py"
         expected: "off-peak"
