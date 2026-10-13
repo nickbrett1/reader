@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 
 from reader import manifest
-from reader.manifest import ManifestError
 
 
 def test_skips_eadir_dsstore_and_junk(tmp_path):
@@ -22,11 +21,15 @@ def test_skips_eadir_dsstore_and_junk(tmp_path):
     assert len(files[0].sha256) == 64
 
 
-def test_one_format_per_work_guard(tmp_path):
+def test_format_clash_keeps_preferred_and_warns(tmp_path):
+    # A duplicate title in two formats must not abort the manifest; epub wins.
     (tmp_path / "b.epub").write_bytes(b"epub")
     (tmp_path / "b.pdf").write_bytes(b"pdf")
-    with pytest.raises(ManifestError, match="mixed formats"):
-        manifest.build(tmp_path)
+    with pytest.warns(UserWarning, match="mixed formats"):
+        works = manifest.build(tmp_path)
+    assert len(works) == 1
+    assert works[0].format == "epub"
+    assert [f.relpath for f in works[0].files] == ["b.epub"]
 
 
 def test_works_grouped_by_dir_and_stem(tmp_path):

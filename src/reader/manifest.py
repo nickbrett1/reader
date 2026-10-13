@@ -6,13 +6,16 @@ Responsibilities:
 * skip Synology ``@eaDir`` sidecar directories and ``.DS_Store`` noise;
 * hash each file (sha256) for provenance;
 * group files into *works* by (directory, stem);
-* guard that a work has exactly one format (a ``book.epub`` and a ``book.pdf``
-  in the same directory is a hard error, not a silent pick of one).
+* resolve a format clash (a ``book.epub`` and a ``book.pdf`` in the same
+  directory) by keeping the higher-priority format and warning — real
+  libraries routinely hold the same title in several formats, and refusing
+  the whole manifest over that would abort the scheduled pipeline.
 """
 
 from __future__ import annotations
 
 import hashlib
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -24,6 +27,11 @@ FORMATS = {
     ".epub": "epub",
     ".pdf": "pdf",
 }
+
+#: Preference order for a format clash (lower number wins). Epub is preferred
+#: over pdf because it yields cleaner text; artbooks are pdf-only, so they are
+#: unaffected.
+FORMAT_PRIORITY = {"epub": 0, "pdf": 1}
 
 _CHUNK = 1 << 20  # 1 MiB
 
@@ -94,10 +102,12 @@ def walk(ingest_dir: Path) -> list[SourceFile]:
 
 
 def group_works(files: list[SourceFile], root: Path) -> list[Work]:
-    """Group files into works and enforce one-format-per-work.
+    """Group files into works, resolving a format clash by preference.
 
     A work is keyed by (containing directory, filename stem).  Two files that
-    share a stem but differ in format are a conflict.
+    share a stem but differ in format are a clash: the higher-priority format
+    (see :data:`FORMAT_PRIORITY`) wins and the others are skipped with a
+    warning, so one stray duplicate cannot abort the whole manifest.
     """
     root = Path(root)
     works: dict[str, Work] = {}
@@ -109,14 +119,21 @@ def group_works(files: list[SourceFile], root: Path) -> list[Work]:
         key = _work_key(directory, stem)
         work = works.get(key)
         if work is None:
-            work = Work(key=key, directory=directory, stem=stem, format=sf.fmt)
-            works[key] = work
-        elif work.format != sf.fmt:
-            raise ManifestError(
-                f"work {key!r} has mixed formats: {work.format} and {sf.fmt} "
-                f"({work.files[0].relpath!r} vs {sf.relpath!r})"
-            )
-        work.files.append(sf)
+            works[key] = Work(key=key, directory=directory, stem=stem, format=sf.fmt, files=[sf])
+            continue
+        if sf.fmt == work.format:
+            work.files.append(sf)
+            continue
+        keep_new = FORMAT_PRIORITY[sf.fmt] < FORMAT_PRIORITY[work.format]
+        kept = sf.fmt if keep_new else work.format
+        ignored = work.files[0].relpath if keep_new else sf.relpath
+        warnings.warn(
+            f"work {key!r} has mixed formats; keeping {kept!r}, ignoring {ignored!r}",
+            stacklevel=2,
+        )
+        if keep_new:
+            work.format = sf.fmt
+            work.files = [sf]
     return [works[k] for k in sorted(works)]
 
 
