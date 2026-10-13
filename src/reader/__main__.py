@@ -279,20 +279,41 @@ def cmd_embed(config: Config, args: argparse.Namespace) -> int:
             api_key=config.turbopuffer_api_key,
             index_dir=config.index_dir,
         )
-        rows: list[dict] = []
+        def publish(rows: list[dict], what: str) -> int:
+            """Upsert rows to the index *before* provenance is stamped.
+
+            Stamping first and upserting later (the old order) means a failure
+            mid-run leaves the vector store stale while SQLite already claims
+            the rows are embedded, so the next run skips them and the index
+            never catches up (reader-artbooks-ingest, 2026-10-13).
+            """
+            if not rows:
+                return 0
+            if args.dry_run:
+                print(f"[dry-run] would upsert {len(rows)} {what} row(s)")
+                return len(rows)
+            idx.upsert(rows)
+            print(f"upserted {len(rows)} {what} row(s) to {config.index_backend} index")
+            return len(rows)
+
+        seen = 0
 
         chunks = store.chunks_to_embed(model)
         if chunks:
             res = client.embed_texts([c["text"] for c in chunks])
-            for c, vec in zip(chunks, res.vectors, strict=True):
-                store.stamp_chunk_embedding(
-                    c["id"], res.model, res.dimensions, res.provenance()["embed_config_version"]
+            rows = [
+                index_mod.text_row(
+                    c["id"], vec, c["text"], book_id=c["book_id"], page_id=c["page_id"]
                 )
-                rows.append(
-                    index_mod.text_row(
-                        c["id"], vec, c["text"], book_id=c["book_id"], page_id=c["page_id"]
+                for c, vec in zip(chunks, res.vectors, strict=True)
+            ]
+            seen += publish(rows, "text")
+            if not args.dry_run:
+                for c in chunks:
+                    store.stamp_chunk_embedding(
+                        c["id"], res.model, res.dimensions,
+                        res.provenance()["embed_config_version"],
                     )
-                )
 
         concepts = store.concepts_to_embed(model)
         if concepts:
@@ -302,32 +323,37 @@ def cmd_embed(config: Config, args: argparse.Namespace) -> int:
                 for c in concepts
             ]
             res = client.embed_texts(texts)
-            for c, vec, text in zip(concepts, res.vectors, texts, strict=True):
-                store.stamp_concept_embedding(
-                    c["id"], res.model, res.dimensions, res.provenance()["embed_config_version"]
-                )
-                rows.append(index_mod.concept_row(c["id"], vec, text))
+            rows = [
+                index_mod.concept_row(c["id"], vec, text)
+                for c, vec, text in zip(concepts, res.vectors, texts, strict=True)
+            ]
+            seen += publish(rows, "concept")
+            if not args.dry_run:
+                for c in concepts:
+                    store.stamp_concept_embedding(
+                        c["id"], res.model, res.dimensions,
+                        res.provenance()["embed_config_version"],
+                    )
 
         images = store.images_to_embed(model)
         if images:
             payload = [(im["mime"], Path(im["path"]).read_bytes()) for im in images]
             res = client.embed_images(payload)
-            for im, vec in zip(images, res.vectors, strict=True):
-                store.stamp_image_embedding(
-                    im["id"], res.model, res.dimensions, res.provenance()["embed_config_version"]
+            rows = [
+                index_mod.image_row(
+                    im["id"], vec, book_id=im["book_id"], page_id=im["page_id"]
                 )
-                rows.append(
-                    index_mod.image_row(
-                        im["id"], vec, book_id=im["book_id"], page_id=im["page_id"]
+                for im, vec in zip(images, res.vectors, strict=True)
+            ]
+            seen += publish(rows, "image")
+            if not args.dry_run:
+                for im in images:
+                    store.stamp_image_embedding(
+                        im["id"], res.model, res.dimensions,
+                        res.provenance()["embed_config_version"],
                     )
-                )
 
-        if rows and not args.dry_run:
-            idx.upsert(rows)
-            print(f"upserted {len(rows)} row(s) to {config.index_backend} index")
-        elif rows:
-            print(f"[dry-run] would upsert {len(rows)} row(s)")
-        else:
+        if seen == 0:
             print("nothing to embed")
     return 0
 
