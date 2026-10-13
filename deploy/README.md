@@ -91,11 +91,22 @@ pin the compose file to a known-good build while you fix the repo:
 Watchtower watches the tag referenced by the compose file, so a pinned SHA tag
 will not be overwritten until you move the image back to `latest`.
 
-## 5. Homepage dashboard
+## 5. Homepage dashboard — N/A for reader
 
-Append `deploy/homepage-services.yaml` to your Homepage `services.yaml`
-(and enable the `homepage` Docker provider) to show a health widget for the
-service.
+reader is a batch CLI worker with no HTTP listener, so there is no endpoint to
+link to or poll. `deploy/homepage-services.yaml` is intentionally a no-op: do
+**not** append it to Homepage's `services.yaml`. The `docker-container` capability
+emitted a Homepage widget and a `3013` port mapping on the assumption of a
+server; both were removed when `docker-compose.yml` was adapted for a worker.
+Re-add them only if a real endpoint is introduced (along with a `healthcheck`).
+
+## 5a. Worker model (why the compose file differs from the generated form)
+
+`reader` is driven by the scheduled pipeline in `deploy/dagu/reader-pipeline.yaml`
+(`docker exec reader reader <step>`), not by inbound requests. The container is
+therefore a long-lived worker (`command: ["sleep","infinity"]`, no published
+port). Deploy it as a Container Manager "Project" exactly like any other compose
+service; dagu does the work.
 
 ## 6. Networking notes
 

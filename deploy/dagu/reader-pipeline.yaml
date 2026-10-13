@@ -11,35 +11,45 @@
 # the dagu UI (port 3006) or with `dagu status reader-pipeline`:
 #   scp deploy/dagu/reader-pipeline.yaml <nas>:/volume1/docker/dagu/dags/
 #
+# reader runs as a long-lived *worker* container (`docker compose up -d`), so
+# every step is executed inside it with `docker exec reader reader <step>`.
 # The container must have READER_INGEST (the staging tree) and READER_DATA (the
 # SQLite + LanceDB record) set, plus LITELLM_BASE_URL / LITELLM_MASTER_KEY.
+#
+# dagu therefore needs access to the Docker daemon (the docker socket, or to run
+# on the NAS host). If dagu is itself a container, mount
+# /var/run/docker.sock into it, or run the steps on the host instead.
+#
+# The off-peak precondition runs `python3 scripts/deepseek_offpeak.py` — that
+# script must be present where dagu runs it (host) or the step must invoke it
+# inside the container.
 
 schedule: "30 10 * * *" # 10:30 UTC daily — outside both peak bands (01:00-04:00, 06:00-10:00)
 
 steps:
   - name: manifest
-    command: reader manifest --commit
+    command: docker exec reader reader manifest --commit
 
   - name: extract
-    command: reader extract
+    command: docker exec reader reader extract
 
   - name: images
-    command: reader images
+    command: docker exec reader reader images
 
   - name: chunk
-    command: reader chunk
+    command: docker exec reader reader chunk
 
   # LLM pass: DeepSeek off-peak only. `deepseek-flash` is the canonical cheap
   # model name (api-docs.deepseek.com); the step is deferred, not failed, when
   # the precondition says it is currently peak.
   - name: concepts
-    command: reader concepts --llm-model deepseek-flash
+    command: docker exec reader reader concepts --llm-model deepseek-flash
     preconditions:
       - condition: "python3 scripts/deepseek_offpeak.py"
         expected: "off-peak"
 
   - name: embed
-    command: reader embed
+    command: docker exec reader reader embed
 
   - name: index-optimize
-    command: reader index --optimize
+    command: docker exec reader reader index --optimize
