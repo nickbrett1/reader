@@ -22,6 +22,7 @@ failure otherwise:
 from __future__ import annotations
 
 import base64
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,6 +36,19 @@ from .schema import (
 #: Cohere / gateway hard limit is 50,000,000 decoded pixels per batch.
 #: We cap at 40 MP to keep a comfortable safety margin.
 MAX_IMAGE_PIXELS_PER_BATCH = 40_000_000
+
+#: Cohere's tokenizer rejects *its own* special tokens (``<|endoftext|>``,
+#: ``<|start_header_id|>``, …) when they appear as literal text; the gateway
+#: surfaces this as HTTP 500 (observed live 2026-10-12 while embedding the
+#: widened corpus — an LLM book quotes ``<|endoftext|>`` in prose).  Strip any
+#: ``<|…|>`` marker from text before embedding.  Applied only to the payload
+#: sent to the gateway, never to stored text, so chunk offsets stay intact.
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|>]{0,64}\|>")
+
+
+def strip_special_tokens(text: str) -> str:
+    """Remove Cohere-special-token-shaped markers from text before embedding."""
+    return _SPECIAL_TOKEN_RE.sub("", text)
 
 
 class MixedModalityError(ValueError):
@@ -283,7 +297,7 @@ class EmbedClient:
 
     def _to_input(self, item: Input) -> str:
         if isinstance(item, TextInput):
-            return item.text
+            return strip_special_tokens(item.text)
         return data_uri(item.mime, resize_image(item.mime, item.data))
 
     @staticmethod

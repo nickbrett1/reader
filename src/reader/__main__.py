@@ -366,6 +366,16 @@ def cmd_eval(config: Config, args: argparse.Namespace) -> int:
 
     labels = json.loads(labels_path.read_text())
     models = args.models.split(",") if args.models else list(EVAL_MODELS)
+    if len(models) > 1:
+        # The index has no model column, so every model is scored against the
+        # corpus vectors left by whichever model last ran `embed`; a multi-model
+        # eval therefore compares QUERY embeddings only (2026-10-12).
+        print(
+            "note: the index stores no model column, so a multi-model eval varies only the "
+            "query embedding; the corpus vectors are whichever model last ran `embed`. "
+            "To compare models against their own corpus, re-embed per model first.",
+            file=sys.stderr,
+        )
     with open_store(config) as store:
         cfg = store.get_embedding_config()
         dimensions = cfg["embedding_dimensions"] if cfg else None
