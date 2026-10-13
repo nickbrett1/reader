@@ -20,9 +20,9 @@
 # on the NAS host). If dagu is itself a container, mount
 # /var/run/docker.sock into it, or run the steps on the host instead.
 #
-# The off-peak precondition runs `python3 scripts/deepseek_offpeak.py` — that
-# script must be present where dagu runs it (host) or the step must invoke it
-# inside the container.
+# The off-peak precondition runs `scripts/deepseek_offpeak.py` *inside the
+# reader container* (the runtime image ships the full source tree), so it does
+# not depend on the dagu container having python3.
 
 schedule: "30 10 * * *" # 10:30 UTC daily — outside both peak bands (01:00-04:00, 06:00-10:00)
 
@@ -45,7 +45,7 @@ steps:
   - name: concepts
     command: docker exec reader reader concepts --llm-model deepseek-flash
     preconditions:
-      - condition: "python3 scripts/deepseek_offpeak.py"
+      - condition: "docker exec reader python3 scripts/deepseek_offpeak.py"
         expected: "off-peak"
 
   - name: embed
