@@ -42,7 +42,8 @@
   "forwardPorts": [],
   "containerEnv": {
     "LANG": "en_US.UTF-8",
-    "LC_ALL": "en_US.UTF-8"
+    "LC_ALL": "en_US.UTF-8",
+    "GOOSE_STATE_MACHINE": "1"
   },
   "remoteEnv": {
     "PATH": "${containerWorkspaceFolder}/.venv/bin:${containerEnv:PATH}"
