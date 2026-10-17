@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Wait for the in-flight pro embed (pid 180138) to exit, then embed whatever
-# chunks/concepts/images remain unstamped for pro, and rebuild the index.
+# HISTORICAL ONE-OFF (2026-10-12/13). Kept only as a record: it waits on a
+# hardcoded pid and points at the pre-cutover gateway. `reader embed` now
+# checkpoints per slice and `reader index --optimize` reconciles, so a crash
+# no longer needs a babysitter script like this.
 set -u
 cd /workspaces/reader
 export READER_INGEST=/workspaces/reader/.ingest
 export READER_DATA=/workspaces/reader/.reader-data
 export LITELLM_BASE_URL=http://nas:4000
-export LITELLM_MASTER_KEY="${LITELLM_MASTER_KEY:-sk-d432ff3fa496fb0e039915995422e9b05b881ba02cdb5d5c}"
+# Never hardcode the gateway key here: this repo is public. Export it instead.
+: "${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in the environment before running this script}"
+export LITELLM_MASTER_KEY
 
 echo "[watch] $(date -u +%H:%M:%S) waiting for pid 180138 ..."
 while kill -0 180138 2>/dev/null; do sleep 10; done
