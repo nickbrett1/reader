@@ -427,7 +427,8 @@ class Store:
         # image.page_no maps to a document_page, so resolve page_id when the
         # book is known; book_id/page_id stay NULL when the book is unknown.
         return self.conn.execute(
-            "SELECT i.id, i.path, i.mime, i.book_id, p.id AS page_id FROM image i "
+            "SELECT i.id, i.path, i.mime, i.w, i.h, i.book_id, p.id AS page_id "
+            "FROM image i "
             "LEFT JOIN document_page p ON p.book_id = i.book_id AND p.page_no = i.page_no "
             "WHERE i.embed_model_id IS NULL OR i.embed_model_id != ? ORDER BY i.id",
             (model_id,),

@@ -85,11 +85,13 @@ def test_embed_selectors_carry_book_and_page(tmp_path):
 
         img = s.upsert_image(
             "imgsha", "/x.bin", "image/png", 3, "embedded", "sha",
-            book_id=bid, page_no=3,
+            book_id=bid, page_no=3, w=1024, h=768,
         )
         [im] = s.images_to_embed("m")
         assert im["book_id"] == bid
         assert im["page_id"] == pid  # page_no 3 resolves to the page
+        # w/h must be selected: cmd_embed's image cost estimate reads them.
+        assert (im["w"], im["h"]) == (1024, 768)
 
         # A book-less image keeps NULL book_id/page_id rather than inventing them.
         s.upsert_image("imgsha2", "/y.bin", "image/png", 3, "embedded", "sha")

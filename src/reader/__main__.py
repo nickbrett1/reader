@@ -362,13 +362,15 @@ def cmd_embed(config: Config, args: argparse.Namespace) -> int:
                     )
                 part = items[i : i + slice_size]
                 payload = payload_fn(part)
+                # Cost is measured *before* anything is published or stamped: if
+                # this raises, no row can be left embedded-but-unrecorded.
+                tokens, usd, measured = measure(kind, part, payload)
                 res = (client.embed_images if kind == "image" else client.embed_texts)(payload)
                 rows = rows_fn(part, res.vectors)
                 seen += publish(rows, kind)
                 for obj in part:
                     stamp_fn(obj, res.model, res.dimensions,
                              res.provenance()["embed_config_version"])
-                tokens, usd, measured = measure(kind, part, payload)
                 usage = res.usage or {}
                 billed = int(usage.get("prompt_tokens") or usage.get("total_tokens") or 0)
                 if billed and kind != "image":
