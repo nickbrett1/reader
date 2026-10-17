@@ -13,7 +13,7 @@ from __future__ import annotations
 
 #: Version of the SQLite schema.  ``gallery`` refuses to read a database whose
 #: recorded version does not match the one it was built against.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: Version of the extraction logic.  Stamped onto every ``document_page`` and
 #: ``image`` row so a re-extract can be scoped to rows produced by an older
@@ -51,6 +51,11 @@ CANDIDATE_DIMENSIONS = (2048, 1536)
 #: budgeting.  The gateway under-bills image tokens and reports 0, so we never
 #: trust its accounting for images.
 COHERE_IMAGE_USD_PER_MTOK = 0.40
+
+#: Text embedding list price, USD per 1M tokens. Used only for the local spend
+#: estimate and the ``--max-usd`` guard; the gateway's own usage is preferred
+#: when it reports tokens.
+COHERE_TEXT_USD_PER_MTOK = 0.12
 
 # --- DDL --------------------------------------------------------------------
 
@@ -213,5 +218,54 @@ MIGRATIONS: dict[int, str] = {
     # calibration dry-run).
     2: """
     ALTER TABLE concept ADD COLUMN description TEXT;
+    """,
+    # v3 — paid-work checkpoints.  A stage may skip a book only when the
+    # columns below say the work was completed for the *current* source file.
+    # deleted_source_sha256 is deliberately NOT backfilled: the first run after
+    # this migration re-extracts once, but upsert_page now preserves chunks when
+    # the text is unchanged, so that pass costs CPU and not an embedding call.
+    3: """
+    ALTER TABLE book ADD COLUMN extracted_source_sha256 TEXT;
+    ALTER TABLE book ADD COLUMN extractor_version       TEXT;
+    ALTER TABLE book ADD COLUMN extracted_at            TEXT;
+    ALTER TABLE book ADD COLUMN images_source_sha256    TEXT;
+    ALTER TABLE book ADD COLUMN images_extracted_at     TEXT;
+    ALTER TABLE book ADD COLUMN concepts_source_sha256  TEXT;
+    ALTER TABLE book ADD COLUMN concepts_extracted_at   TEXT;
+
+    -- A concept mention is identified by (concept, page, offsets).  Collapse
+    -- any duplicates left by pre-v3 reruns before enforcing that.
+    DELETE FROM concept_mention WHERE id NOT IN (
+        SELECT MIN(id) FROM concept_mention
+        GROUP BY concept_id, page_id, start_offset, end_offset
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_mention
+        ON concept_mention (concept_id, page_id, start_offset, end_offset);
+
+    -- Books already carrying mentions were concept-extracted at least once;
+    -- mark them done so the first post-migration run does not re-pay for them.
+    UPDATE book
+       SET concepts_source_sha256 = source_sha256,
+           concepts_extracted_at  = added_at
+     WHERE EXISTS (
+        SELECT 1 FROM concept_mention m
+          JOIN document_page p ON p.id = m.page_id
+         WHERE p.book_id = book.id
+     );
+
+    -- Out-of-band spend ledger.  The gateway reports 0 for image tokens, so
+    -- ``measured`` says whether ``tokens`` came from the gateway or an estimate.
+    CREATE TABLE IF NOT EXISTS spend (
+        id         INTEGER PRIMARY KEY,
+        run_id     INTEGER,
+        stage      TEXT    NOT NULL,
+        kind       TEXT    NOT NULL,
+        model      TEXT    NOT NULL,
+        items      INTEGER NOT NULL,
+        tokens     INTEGER NOT NULL DEFAULT 0,
+        usd        REAL    NOT NULL DEFAULT 0,
+        measured   INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT    NOT NULL
+    );
     """,
 }

@@ -174,35 +174,67 @@ class Store:
         scanned: bool = False,
         extractor_version: str = schema.EXTRACTOR_VERSION,
     ) -> int:
-        self.conn.execute(
+        row = self.conn.execute(
+            "SELECT id, text, extractor_version FROM document_page "
+            "WHERE book_id = ? AND page_no = ?",
+            (book_id, page_no),
+        ).fetchone()
+        if row is not None:
+            page_id = int(row["id"])
+            # Unchanged text at the same extractor version invalidates nothing:
+            # keep the chunks (and therefore their embedding provenance).
+            if row["text"] == text and row["extractor_version"] == extractor_version:
+                return page_id
+            self.conn.execute(
+                "UPDATE document_page SET text = ?, scanned = ?, "
+                "extractor_version = ?, source_sha256 = ? WHERE id = ?",
+                (text, int(scanned), extractor_version, source_sha256, page_id),
+            )
+            # The text changed: chunks cut from the old text are stale.
+            self.conn.execute("DELETE FROM chunk WHERE page_id = ?", (page_id,))
+            self.conn.commit()
+            return page_id
+
+        cur = self.conn.execute(
             """
             INSERT INTO document_page (book_id, page_no, text, scanned,
                                        extractor_version, source_sha256)
             VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(book_id, page_no) DO UPDATE SET
-                text = excluded.text, scanned = excluded.scanned,
-                extractor_version = excluded.extractor_version,
-                source_sha256 = excluded.source_sha256
             """,
             (book_id, page_no, text, int(scanned), extractor_version, source_sha256),
         )
-        row = self.conn.execute(
-            "SELECT id FROM document_page WHERE book_id = ? AND page_no = ?",
-            (book_id, page_no),
-        ).fetchone()
-        page_id = int(row["id"])
-        # A re-extract invalidates any chunks cut from the old text.
-        self.conn.execute("DELETE FROM chunk WHERE page_id = ?", (page_id,))
         self.conn.commit()
-        return page_id
+        return int(cur.lastrowid)
 
     def set_chunks(self, page_id: int, chunks: Sequence[tuple[int, int, int, str]]) -> None:
-        """Replace a page's chunks.  ``chunks`` = (ordinal, start, end, text)."""
+        """Replace a page's chunks.  ``chunks`` = (ordinal, start, end, text).
+
+        Provenance is carried forward for a chunk whose (start, end, text) is
+        identical to the one it replaces, so a re-chunk of unchanged text does
+        not force a re-embed.  This is the expensive invariant: new ids for the
+        same bytes must not look like new work.
+        """
+        old = {
+            (r["start_offset"], r["end_offset"], r["text"]): (
+                r["embed_model_id"], r["dimensions"],
+                r["embed_config_version"], r["embedded_at"],
+            )
+            for r in self.conn.execute(
+                "SELECT start_offset, end_offset, text, embed_model_id, dimensions, "
+                "embed_config_version, embedded_at FROM chunk WHERE page_id = ?",
+                (page_id,),
+            )
+        }
         self.conn.execute("DELETE FROM chunk WHERE page_id = ?", (page_id,))
+        rows = []
+        for ordinal, start, end, text in chunks:
+            prov = old.get((start, end, text), (None, None, None, None))
+            rows.append((page_id, ordinal, start, end, text, *prov))
         self.conn.executemany(
-            "INSERT INTO chunk (page_id, ordinal, start_offset, end_offset, text) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [(page_id, o, s, e, t) for (o, s, e, t) in chunks],
+            "INSERT INTO chunk (page_id, ordinal, start_offset, end_offset, text, "
+            "embed_model_id, dimensions, embed_config_version, embedded_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
         )
         self.conn.commit()
 
@@ -282,7 +314,7 @@ class Store:
         self, concept_id: int, surface_id: int, page_id: int, start: int, end: int
     ) -> None:
         self.conn.execute(
-            "INSERT INTO concept_mention (concept_id, surface_id, page_id, "
+            "INSERT OR IGNORE INTO concept_mention (concept_id, surface_id, page_id, "
             "start_offset, end_offset) VALUES (?, ?, ?, ?, ?)",
             (concept_id, surface_id, page_id, start, end),
         )
@@ -407,6 +439,74 @@ class Store:
             "WHERE embed_model_id IS NULL OR embed_model_id != ? ORDER BY id",
             (model_id,),
         ).fetchall()
+
+    # --- per-book stage checkpoints ----------------------------------------
+
+    def _book_stamp(self, work_key: str, column: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            f"SELECT id, source_sha256, {column} FROM book WHERE work_key = ?", (work_key,)
+        ).fetchone()
+
+    def book_extraction_current(self, work_key: str, sha256: str) -> bool:
+        """True when this source file was fully extracted by this extractor."""
+        row = self._book_stamp(work_key, "extracted_source_sha256")
+        return bool(
+            row
+            and row["extracted_source_sha256"] == sha256
+            and self.conn.execute(
+                "SELECT extractor_version FROM book WHERE id = ?", (row["id"],)
+            ).fetchone()[0] == schema.EXTRACTOR_VERSION
+        )
+
+    def mark_book_extracted(self, book_id: int, sha256: str) -> None:
+        self.conn.execute(
+            "UPDATE book SET extracted_source_sha256 = ?, extractor_version = ?, "
+            "extracted_at = ? WHERE id = ?",
+            (sha256, schema.EXTRACTOR_VERSION, now_iso(), book_id),
+        )
+        self.conn.commit()
+
+    def book_images_current(self, work_key: str, sha256: str) -> bool:
+        row = self._book_stamp(work_key, "images_source_sha256")
+        return bool(row and row["images_source_sha256"] == sha256)
+
+    def mark_book_images(self, book_id: int, sha256: str) -> None:
+        self.conn.execute(
+            "UPDATE book SET images_source_sha256 = ?, images_extracted_at = ? WHERE id = ?",
+            (sha256, now_iso(), book_id),
+        )
+        self.conn.commit()
+
+    def book_concepts_current(self, work_key: str, sha256: str) -> bool:
+        row = self._book_stamp(work_key, "concepts_source_sha256")
+        return bool(row and row["concepts_source_sha256"] == sha256)
+
+    def mark_book_concepts(self, book_id: int, sha256: str) -> None:
+        self.conn.execute(
+            "UPDATE book SET concepts_source_sha256 = ?, concepts_extracted_at = ? "
+            "WHERE id = ?",
+            (sha256, now_iso(), book_id),
+        )
+        self.conn.commit()
+
+    # --- spend ledger -------------------------------------------------------
+
+    def record_spend(
+        self, run_id: int | None, kind: str, model: str, items: int,
+        tokens: int, usd: float, measured: bool,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO spend (run_id, stage, kind, model, items, tokens, usd, "
+            "measured, created_at) VALUES (?, 'embed', ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, kind, model, items, tokens, usd, int(measured), now_iso()),
+        )
+        self.conn.commit()
+
+    def spend_for_run(self, run_id: int) -> float:
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(usd), 0) FROM spend WHERE run_id = ?", (run_id,)
+        ).fetchone()
+        return float(row[0])
 
     # --- reporting ----------------------------------------------------------
 

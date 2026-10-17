@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from collections.abc import Iterator, Sequence
@@ -27,6 +28,7 @@ from . import extract as extract_mod
 from . import images as images_mod
 from . import index as index_mod
 from . import manifest as manifest_mod
+from . import schema
 from .config import Config
 from .embed import EmbedClient
 from .store import Store
@@ -125,11 +127,16 @@ def cmd_extract(config: Config, args: argparse.Namespace) -> int:
             book_id = store.upsert_book(
                 w.key, w.format, sf.relpath, sf.sha256, title=w.stem
             )
+            if store.book_extraction_current(w.key, sf.sha256):
+                print(f"skipped {w.key} (unchanged, extractor {schema.EXTRACTOR_VERSION})")
+                continue
             pages = extract_mod.extract(sf.path, w.format)
             for p in pages:
                 store.upsert_page(
                     book_id, p.page_no, p.text, sf.sha256, scanned=p.scanned
                 )
+            # Stamp only after every page landed: a crash mid-book re-runs it.
+            store.mark_book_extracted(book_id, sf.sha256)
             print(f"extracted {len(pages)} page(s) from {w.key}")
     return 0
 
@@ -160,6 +167,9 @@ def cmd_images(config: Config, args: argparse.Namespace) -> int:
         for w in works:
             sf = _work_source(w)
             book_id = store.upsert_book(w.key, w.format, sf.relpath, sf.sha256, title=w.stem)
+            if store.book_images_current(w.key, sf.sha256):
+                print(f"{w.key}: skipped (unchanged)")
+                continue
             raw = images_mod.extract_embedded(sf.path, w.format)
             if w.format == "pdf":
                 pages = extract_mod.pdf_pages(sf.path)
@@ -176,6 +186,7 @@ def cmd_images(config: Config, args: argparse.Namespace) -> int:
                     phash=d.phash, w=img.w, h=img.h, book_id=book_id,
                     page_no=img.page_no, caption=img.caption, thumb=thumb,
                 )
+            store.mark_book_images(book_id, sf.sha256)
             total += len(deduped)
             print(f"{w.key}: {len(raw)} raw -> {len(deduped)} unique image(s)")
         print(f"{total} image(s) stored")
@@ -214,11 +225,16 @@ def cmd_concepts(config: Config, args: argparse.Namespace) -> int:
     if getattr(args, "books", None):
         only = {int(x) for x in str(args.books).split(",") if x.strip()}
     with open_store(config) as store, recorded(store, "concepts"):
-        books = store.conn.execute("SELECT id, work_key FROM book ORDER BY id").fetchall()
+        books = store.conn.execute(
+            "SELECT id, work_key, source_sha256 FROM book ORDER BY id"
+        ).fetchall()
         if only is not None:
             books = [b for b in books if b["id"] in only]
         created = 0
         for b in books:
+            if not args.force and store.book_concepts_current(b["work_key"], b["source_sha256"]):
+                print(f"{b['work_key']}: skipped (concepts current)")
+                continue
             pages = store.conn.execute(
                 "SELECT id, page_no, text FROM document_page WHERE book_id = ? ORDER BY page_no",
                 (b["id"],),
@@ -245,6 +261,8 @@ def cmd_concepts(config: Config, args: argparse.Namespace) -> int:
                     if page is not None:
                         store.add_mention(cid, sid, page["id"], start, end)
                 created += 1
+            # Stamp only after the book's mentions are written.
+            store.mark_book_concepts(b["id"], b["source_sha256"])
             print(f"{b['work_key']}: {len(candidates)} concept(s)")
         if args.rebuild_derived:
             store.rebuild_derived()
@@ -265,7 +283,7 @@ def _page_for_offset(pages: Sequence[object], offset: int):
 
 def cmd_embed(config: Config, args: argparse.Namespace) -> int:
     model = args.model or DEFAULT_MODEL
-    with open_store(config) as store, recorded(store, "embed"):
+    with open_store(config) as store, recorded(store, "embed") as run_id:
         cfg = store.get_embedding_config()
         dimensions = args.dimensions or (cfg["embedding_dimensions"] if cfg else None)
         if dimensions is None:
@@ -299,62 +317,103 @@ def cmd_embed(config: Config, args: argparse.Namespace) -> int:
         seen = 0
 
         chunks = store.chunks_to_embed(model)
-        if chunks:
-            res = client.embed_texts([c["text"] for c in chunks])
-            rows = [
-                index_mod.text_row(
-                    c["id"], vec, c["text"], book_id=c["book_id"], page_id=c["page_id"]
-                )
-                for c, vec in zip(chunks, res.vectors, strict=True)
-            ]
-            seen += publish(rows, "text")
-            if not args.dry_run:
-                for c in chunks:
-                    store.stamp_chunk_embedding(
-                        c["id"], res.model, res.dimensions,
-                        res.provenance()["embed_config_version"],
-                    )
-
         concepts = store.concepts_to_embed(model)
-        if concepts:
-            # §6.2.2: embed canonical_name + description, not the bare name.
-            texts = [
-                f"{c['name']}. {c['description']}" if c["description"] else c["name"]
-                for c in concepts
-            ]
-            res = client.embed_texts(texts)
-            rows = [
-                index_mod.concept_row(c["id"], vec, text)
-                for c, vec, text in zip(concepts, res.vectors, texts, strict=True)
-            ]
-            seen += publish(rows, "concept")
-            if not args.dry_run:
-                for c in concepts:
-                    store.stamp_concept_embedding(
-                        c["id"], res.model, res.dimensions,
-                        res.provenance()["embed_config_version"],
-                    )
-
         images = store.images_to_embed(model)
-        if images:
-            payload = [(im["mime"], Path(im["path"]).read_bytes()) for im in images]
-            res = client.embed_images(payload)
-            rows = [
-                index_mod.image_row(
-                    im["id"], vec, book_id=im["book_id"], page_id=im["page_id"]
-                )
-                for im, vec in zip(images, res.vectors, strict=True)
-            ]
-            seen += publish(rows, "image")
-            if not args.dry_run:
-                for im in images:
-                    store.stamp_image_embedding(
-                        im["id"], res.model, res.dimensions,
-                        res.provenance()["embed_config_version"],
-                    )
-
-        if seen == 0:
+        pending = len(chunks) + len(concepts) + len(images)
+        if pending == 0:
             print("nothing to embed")
+            return 0
+        if args.dry_run:
+            # A dry run must not call the paid API: report the queue and stop.
+            print(
+                f"[dry-run] {pending} row(s) pending "
+                f"({len(chunks)} text, {len(concepts)} concept, {len(images)} image); "
+                "no API calls made"
+            )
+            return 0
+
+        slice_size = max(1, args.batch_items)
+        spent = 0.0
+
+        def measure(kind: str, part: Sequence[object], payload: Sequence[object]):
+            if kind == "image":
+                tok = 0
+                for im in part:
+                    w, h = im["w"], im["h"]
+                    if not w or not h:
+                        continue
+                    ww, hh = w, h
+                    if ww * hh > schema.IMAGE_MAX_PIXELS:
+                        scale = (schema.IMAGE_MAX_PIXELS / (ww * hh)) ** 0.5
+                        hh = max(1, int(hh * scale))
+                        ww = max(1, round(ww * hh / h))
+                    tok += math.ceil(ww / 32) * math.ceil(hh / 32) + 2
+                return tok, tok / 1e6 * schema.COHERE_IMAGE_USD_PER_MTOK, False
+            tok = sum(len(t) for t in payload) // 4
+            return tok, tok / 1e6 * schema.COHERE_TEXT_USD_PER_MTOK, False
+
+        def run_kind(kind, items, payload_fn, rows_fn, stamp_fn):
+            """Embed one slice at a time: a crash loses at most batch_items."""
+            nonlocal seen, spent
+            for i in range(0, len(items), slice_size):
+                if args.max_usd is not None and spent >= args.max_usd:
+                    raise SystemExit(
+                        f"embedding budget exhausted: ${spent:.4f} >= ${args.max_usd:.2f}"
+                    )
+                part = items[i : i + slice_size]
+                payload = payload_fn(part)
+                res = (client.embed_images if kind == "image" else client.embed_texts)(payload)
+                rows = rows_fn(part, res.vectors)
+                seen += publish(rows, kind)
+                for obj in part:
+                    stamp_fn(obj, res.model, res.dimensions,
+                             res.provenance()["embed_config_version"])
+                tokens, usd, measured = measure(kind, part, payload)
+                usage = res.usage or {}
+                billed = int(usage.get("prompt_tokens") or usage.get("total_tokens") or 0)
+                if billed and kind != "image":
+                    tokens, measured = billed, True
+                    usd = billed / 1e6 * schema.COHERE_TEXT_USD_PER_MTOK
+                spent += usd
+                store.record_spend(run_id, kind, res.model, len(part), tokens, usd, measured)
+                print(f"  {kind}: {len(part)} row(s), {tokens} tok, ${usd:.4f}"
+                      + ("" if measured else " (estimated)"))
+
+        run_kind(
+            "text", chunks,
+            lambda part: [c["text"] for c in part],
+            lambda part, vecs: [
+                index_mod.text_row(c["id"], v, c["text"],
+                                   book_id=c["book_id"], page_id=c["page_id"])
+                for c, v in zip(part, vecs, strict=True)
+            ],
+            lambda c, m, d, cv: store.stamp_chunk_embedding(c["id"], m, d, cv),
+        )
+
+        def concept_text(c) -> str:
+            # §6.2.2: embed canonical_name + description, not the bare name.
+            return f"{c['name']}. {c['description']}" if c["description"] else c["name"]
+
+        run_kind(
+            "concept", concepts,
+            lambda part: [concept_text(c) for c in part],
+            lambda part, vecs: [
+                index_mod.concept_row(c["id"], v, concept_text(c))
+                for c, v in zip(part, vecs, strict=True)
+            ],
+            lambda c, m, d, cv: store.stamp_concept_embedding(c["id"], m, d, cv),
+        )
+
+        run_kind(
+            "image", images,
+            lambda part: [(im["mime"], Path(im["path"]).read_bytes()) for im in part],
+            lambda part, vecs: [
+                index_mod.image_row(im["id"], v,
+                                    book_id=im["book_id"], page_id=im["page_id"])
+                for im, v in zip(part, vecs, strict=True)
+            ],
+            lambda im, m, d, cv: store.stamp_image_embedding(im["id"], m, d, cv),
+        )
     return 0
 
 
@@ -508,13 +567,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="gateway chat model for extraction (default $READER_CONCEPT_MODEL; "
         "absent -> deterministic heuristic)",
     )
+    k.add_argument("--force", action="store_true", help="re-extract even if current")
     k.add_argument("--rebuild-derived", action="store_true")
     k.set_defaults(func=cmd_concepts)
 
     em = sub.add_parser("embed", help="embed text/images/concepts via the gateway")
     em.add_argument("--model", default=None)
     em.add_argument("--dimensions", type=int, default=None)
-    em.add_argument("--dry-run", action="store_true")
+    em.add_argument("--dry-run", action="store_true", help="report the queue; no API calls")
+    em.add_argument("--batch-items", type=int, default=256,
+                    help="rows per checkpointed slice (default 256)")
+    em.add_argument("--max-usd", type=float, default=None,
+                    help="abort before a slice that would exceed this run's spend")
     em.set_defaults(func=cmd_embed)
 
     ev = sub.add_parser("eval", help="recall@10 across models; pin the dimensionality")
@@ -527,7 +591,9 @@ def build_parser() -> argparse.ArgumentParser:
     re = sub.add_parser("reembed", help="re-embed everything under a new model")
     re.add_argument("--model", required=True)
     re.add_argument("--dimensions", type=int, default=None)
-    re.add_argument("--dry-run", action="store_true")
+    re.add_argument("--dry-run", action="store_true", help="report the queue; no API calls")
+    re.add_argument("--batch-items", type=int, default=256)
+    re.add_argument("--max-usd", type=float, default=None)
     re.set_defaults(func=cmd_reembed)
 
     ix = sub.add_parser("index", help="index maintenance: build, optimize, stats")
