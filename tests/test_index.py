@@ -69,3 +69,41 @@ def test_factory_selects_backend(tmp_path):
     assert isinstance(create_index("turbopuffer", dimensions=4, api_key="x"), Index)
     with pytest.raises(ValueError):
         create_index("nope", dimensions=4, index_dir=tmp_path / "i")
+
+
+def test_ids_by_kind_reads_back_what_was_written(tmp_path):
+    idx = LanceIndex(tmp_path / "idx", 4)
+    idx.upsert(_rows())
+    assert idx.ids_by_kind() == {"text": {1, 2}, "concept": {1}, "image": {1}}
+
+
+def test_prune_drops_vectors_whose_record_was_deleted(tmp_path):
+    """A re-created chunk gets a new id, orphaning its old vector."""
+    idx = LanceIndex(tmp_path / "idx", 4)
+    idx.upsert(_rows())
+    # SQLite still has text:1 and every concept/image row, but text:2 is gone.
+    pruned = idx.prune({"text": {1}, "concept": {1}, "image": {1}})
+    assert pruned == 1
+    assert idx.ids_by_kind() == {"text": {1}, "concept": {1}, "image": {1}}
+    assert idx.count() == 3
+
+
+def test_prune_leaves_omitted_kinds_alone(tmp_path):
+    """Omitting a kind must never be read as 'delete all of it'."""
+    idx = LanceIndex(tmp_path / "idx", 4)
+    idx.upsert(_rows())
+    assert idx.prune({"text": {1, 2}}) == 0
+    assert idx.count() == 4
+
+
+def test_prune_is_free_when_nothing_is_stale(tmp_path):
+    idx = LanceIndex(tmp_path / "idx", 4)
+    idx.upsert(_rows())
+    assert idx.prune({"text": {1, 2}, "concept": {1}, "image": {1}}) == 0
+    assert idx.count() == 4
+
+
+def test_prune_on_missing_table_is_a_noop(tmp_path):
+    idx = LanceIndex(tmp_path / "idx", 4)  # nothing written yet
+    assert idx.prune({"text": {1}}) == 0
+    assert idx.count() == 0

@@ -438,6 +438,11 @@ def cmd_index(config: Config, args: argparse.Namespace) -> int:
         )
         if isinstance(idx, index_mod.LanceIndex):
             if args.optimize:
+                # Reconcile before compacting: compaction cannot drop a vector
+                # whose SQLite row was deleted, it just makes it cheap to read.
+                pruned = idx.prune(store.index_keep_ids())
+                if pruned:
+                    print(f"pruned {pruned} stale row(s) with no SQLite record")
                 idx.optimize(args.cleanup_older_than_days)
             print(f"backend={config.index_backend} table={idx.table_name} rows={idx.count()}")
         else:
@@ -599,7 +604,11 @@ def build_parser() -> argparse.ArgumentParser:
     re.set_defaults(func=cmd_reembed)
 
     ix = sub.add_parser("index", help="index maintenance: build, optimize, stats")
-    ix.add_argument("--optimize", action="store_true", help="compact versions + rebuild indices")
+    ix.add_argument(
+        "--optimize",
+        action="store_true",
+        help="prune rows with no SQLite record, compact versions, rebuild indices",
+    )
     ix.add_argument("--cleanup-older-than-days", type=int, default=None)
     ix.set_defaults(func=cmd_index)
 

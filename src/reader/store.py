@@ -434,6 +434,19 @@ class Store:
             (model_id,),
         ).fetchall()
 
+    def index_keep_ids(self) -> dict[str, set[int]]:
+        """Record ids the index is allowed to hold, per kind.
+
+        Fed to ``LanceIndex.prune`` so vectors for deleted records are
+        dropped.  Every row counts here - not just embedded ones - because a
+        record awaiting re-embedding still legitimately owns its index row.
+        """
+        return {
+            "text": {int(r["id"]) for r in self.conn.execute("SELECT id FROM chunk")},
+            "concept": {int(r["id"]) for r in self.conn.execute("SELECT id FROM concept")},
+            "image": {int(r["id"]) for r in self.conn.execute("SELECT id FROM image")},
+        }
+
     def concepts_to_embed(self, model_id: str) -> list[sqlite3.Row]:
         return self.conn.execute(
             "SELECT id, name, description FROM concept "

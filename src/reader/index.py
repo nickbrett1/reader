@@ -12,7 +12,7 @@ The index is always rebuildable from SQLite.  If the two disagree, SQLite wins:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -346,6 +346,60 @@ class LanceIndex:
     def count(self) -> int:
         tbl = self._table()
         return tbl.count_rows() if tbl is not None else 0
+
+    # --- reconciliation ------------------------------------------------------
+
+    def ids_by_kind(self) -> dict[str, set[int]]:
+        """Record ids currently held in the index, keyed by ``kind``."""
+        tbl = self._table()
+        if tbl is None:
+            return {}
+        table = (
+            tbl.search()
+            .limit(tbl.count_rows())  # an unqueried search is a full scan; be explicit anyway
+            .select(["id", "kind"])
+            .to_arrow()
+        )
+        ids: dict[str, set[int]] = {}
+        for id_, kind in zip(
+            table.column("id").to_pylist(),
+            table.column("kind").to_pylist(),
+            strict=True,
+        ):
+            ids.setdefault(str(kind), set()).add(int(str(id_).rsplit(":", 1)[-1]))
+        return ids
+
+    def prune(
+        self,
+        keep: Mapping[str, Collection[int]],
+        batch_size: int = 512,
+    ) -> int:
+        """Delete index rows whose SQLite record no longer exists.
+
+        SQLite is the system of record and the index holds only derived
+        vectors, joined by the ``<kind>:<id>`` string convention rather than a
+        foreign key.  So when a chunk is deleted and re-created it comes back
+        with a *new* id and its old vector is orphaned: never re-embedded (no
+        API cost) but still returned by queries, pointing at text that can no
+        longer be loaded.
+
+        ``keep`` maps kind -> the ids SQLite still has.  Only kinds named in
+        ``keep`` are pruned: a kind that is omitted is left untouched rather
+        than being emptied by omission.  Returns the number of rows deleted.
+        """
+        tbl = self._table()
+        if tbl is None:
+            return 0
+        present = self.ids_by_kind()
+        stale = [
+            f"{kind}:{row_id}"
+            for kind, wanted in keep.items()
+            for row_id in sorted(present.get(kind, set()) - set(wanted))
+        ]
+        for i in range(0, len(stale), batch_size):
+            quoted = ", ".join(f"'{s}'" for s in stale[i : i + batch_size])
+            tbl.delete(f"id IN ({quoted})")
+        return len(stale)
 
     def drop(self) -> None:
         try:
