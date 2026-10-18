@@ -8,6 +8,17 @@
 # agent-side prerequisites for all of them are in .buildkite/README.md.
 
 steps:
+  - label: ":detective: Secret scan (gitleaks, full history)"
+    key: secret_scan
+    agents:
+      queue: mac-studio-linux
+    commands:
+      # Native rather than a docker plugin: the scan needs the checkout's own
+      # .git history, which a container mount makes awkward, and the result must
+      # not depend on which image tag happens to be pullable.
+      - bash scripts/install-gitleaks.sh
+      - '"$HOME/.local/bin/gitleaks" git --redact --verbose .'
+
   - label: ":hammer: Build and test (python)"
     key: build
     agents:

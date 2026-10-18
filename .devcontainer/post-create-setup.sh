@@ -227,8 +227,8 @@ else
 fi
 
 
-echo "INFO: Installing git pre-commit hooks (lint-staged)..."
-(cd /workspaces/reader && npx --yes simple-git-hooks) || echo "WARN: Run 'npx simple-git-hooks' to install hooks manually."
+echo "INFO: Installing git hooks (gitleaks secret scan; lint-staged when available)..."
+(cd /workspaces/reader && bash scripts/setup-git-hooks.sh) || exit 1
 
 
 
