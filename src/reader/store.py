@@ -165,6 +165,127 @@ class Store:
         ).fetchone()
         return int(row["id"])
 
+    def books_matching(
+        self, ids: set[int] | None = None, work_keys: set[str] | None = None
+    ) -> list[sqlite3.Row]:
+        """Return books matching either selector, ordered by id."""
+        clauses: list[str] = []
+        params: list[object] = []
+        if ids:
+            clauses.append(f"id IN ({','.join('?' * len(ids))})")
+            params.extend(sorted(ids))
+        if work_keys:
+            clauses.append(f"work_key IN ({','.join('?' * len(work_keys))})")
+            params.extend(sorted(work_keys))
+        if not clauses:
+            return []
+        return self.conn.execute(
+            f"SELECT id, work_key, title, source_path FROM book "
+            f"WHERE {' OR '.join(clauses)} ORDER BY id",
+            tuple(params),
+        ).fetchall()
+
+    def delete_books(self, book_ids: set[int]) -> dict[str, object]:
+        """Delete books and everything derived from them.
+
+        SQLite is the system of record, so this is the authoritative removal
+        path; the vector index is reconciled afterwards by ``index --optimize``
+        (or by :meth:`reader.__main__.cmd_prune`).  Concepts shared with a kept
+        book survive; concepts left with no mentions are removed along with
+        their surfaces, review decisions and derived rows.
+        """
+        if not book_ids:
+            return {"books": 0, "pages": 0, "chunks": 0, "images": 0, "concepts": 0, "paths": []}
+        ids = sorted(
+            int(r["id"])
+            for r in self.conn.execute(
+                f"SELECT id FROM book WHERE id IN ({','.join('?' * len(book_ids))})",
+                tuple(sorted(book_ids)),
+            )
+        )
+        if not ids:
+            return {"books": 0, "pages": 0, "chunks": 0, "images": 0, "concepts": 0, "paths": []}
+        q = ",".join("?" * len(ids))
+        params = tuple(ids)
+        page_ids = [
+            int(r["id"])
+            for r in self.conn.execute(
+                f"SELECT id FROM document_page WHERE book_id IN ({q})", params
+            )
+        ]
+        chunk_count = 0
+        if page_ids:
+            pq = ",".join("?" * len(page_ids))
+            chunk_count = int(
+                self.conn.execute(
+                    f"SELECT COUNT(*) FROM chunk WHERE page_id IN ({pq})",
+                    tuple(page_ids),
+                ).fetchone()[0]
+            )
+        image_paths = [
+            str(r["path"])
+            for r in self.conn.execute(
+                f"SELECT path FROM image WHERE book_id IN ({q})", params
+            )
+        ]
+        concept_ids: set[int] = set()
+        if page_ids:
+            pq = ",".join("?" * len(page_ids))
+            concept_ids = {
+                int(r["concept_id"])
+                for r in self.conn.execute(
+                    f"SELECT DISTINCT concept_id FROM concept_mention "
+                    f"WHERE page_id IN ({pq})",
+                    tuple(page_ids),
+                )
+            }
+        with self.conn:  # one transaction: a crash leaves the corpus unchanged
+            if page_ids:
+                pq = ",".join("?" * len(page_ids))
+                self.conn.execute(
+                    f"DELETE FROM concept_mention WHERE page_id IN ({pq})",
+                    tuple(page_ids),
+                )
+                self.conn.execute(
+                    f"DELETE FROM chunk WHERE page_id IN ({pq})", tuple(page_ids)
+                )
+                self.conn.execute(
+                    f"DELETE FROM document_page WHERE id IN ({pq})", tuple(page_ids)
+                )
+            self.conn.execute(f"DELETE FROM image WHERE book_id IN ({q})", params)
+            self.conn.execute(f"DELETE FROM book WHERE id IN ({q})", params)
+
+            deleted_concepts = 0
+            for cid in sorted(concept_ids):
+                still_used = self.conn.execute(
+                    "SELECT 1 FROM concept_mention WHERE concept_id = ? LIMIT 1", (cid,)
+                ).fetchone()
+                if still_used:
+                    continue
+                self.conn.execute("DELETE FROM concept_surface WHERE concept_id = ?", (cid,))
+                self.conn.execute(
+                    "DELETE FROM concept_review WHERE from_id = ? OR to_id = ?", (cid, cid)
+                )
+                self.conn.execute("DELETE FROM concept_merge WHERE from_id = ? OR to_id = ?", (cid, cid))
+                self.conn.execute(
+                    "DELETE FROM concept_resolution WHERE concept_id = ? OR resolved_id = ?",
+                    (cid, cid),
+                )
+                self.conn.execute("DELETE FROM concept WHERE id = ?", (cid,))
+                deleted_concepts += 1
+
+        counts = {
+            "books": len(ids),
+            "pages": len(page_ids),
+            "chunks": chunk_count,
+            "images": len(image_paths),
+            "concepts": deleted_concepts,
+            "paths": image_paths,
+        }
+        self.rebuild_derived()
+        self.conn.execute("VACUUM")
+        return counts
+
     def upsert_page(
         self,
         book_id: int,

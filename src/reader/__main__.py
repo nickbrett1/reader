@@ -450,6 +450,86 @@ def cmd_index(config: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _parse_id_spec(value: object) -> set[int]:
+    """Parse ``4-38,42`` into ``{4,...,38,42}``."""
+    out: set[int] = set()
+    if not value:
+        return out
+    for part in str(value).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-", 1)
+            out.update(range(int(start), int(end) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+def cmd_prune(config: Config, args: argparse.Namespace) -> int:
+    """Remove books from the corpus: SQLite first, then the derived index."""
+    ids = _parse_id_spec(args.books)
+    keys = {
+        k.strip() for k in str(args.work_keys or "").split(",") if k.strip()
+    }
+    if not ids and not keys:
+        print("prune needs --books and/or --work-keys", file=sys.stderr)
+        return 2
+    with open_store(config) as store, recorded(store, "prune"):
+        targets = store.books_matching(ids=ids or None, work_keys=keys or None)
+        if not targets:
+            print("no books matched; nothing to prune")
+            return 0
+        for b in targets:
+            print(f"prune {b['id']:>3}  {b['work_key']}  ({b['source_path']})")
+        if args.dry_run:
+            print(f"[dry-run] would prune {len(targets)} book(s); no changes made")
+            return 0
+        if not args.yes:
+            print("refusing to delete without --yes (re-run with --yes)", file=sys.stderr)
+            return 2
+
+        removed = store.delete_books({int(b["id"]) for b in targets})
+
+        missing = 0
+        for raw in removed["paths"]:  # type: ignore[union-attr]
+            path = Path(str(raw))
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                missing += 1
+        if args.delete_sources:
+            for b in targets:
+                path = config.ingest_dir / str(b["source_path"])
+                try:
+                    path.unlink()
+                    print(f"removed source {path}")
+                except FileNotFoundError:
+                    print(f"source already absent: {path}")
+
+        cfg = store.get_embedding_config()
+        idx = index_mod.create_index(
+            config.index_backend,
+            dimensions=cfg["embedding_dimensions"] if cfg else None,
+            api_key=config.turbopuffer_api_key,
+            index_dir=config.index_dir,
+        )
+        pruned = 0
+        if isinstance(idx, index_mod.LanceIndex):
+            pruned = idx.prune(store.index_keep_ids())
+            idx.optimize()
+
+        print(
+            f"pruned {removed['books']} book(s), {removed['pages']} page(s), "
+            f"{removed['chunks']} chunk(s), {removed['images']} image(s), "
+            f"{removed['concepts']} concept(s); "
+            f"{pruned} index row(s) removed"
+            + (f" ({missing} image blob(s) already absent)" if missing else "")
+        )
+    return 0
+
+
 def _index_id(value: object, default_kind: str = "text") -> str:
     """Normalise an eval label to an index row id.
 
@@ -587,6 +667,15 @@ def build_parser() -> argparse.ArgumentParser:
     em.add_argument("--max-usd", type=float, default=None,
                     help="abort before a slice that would exceed this run's spend")
     em.set_defaults(func=cmd_embed)
+
+    pr = sub.add_parser("prune", help="remove books from SQLite, blobs and the index")
+    pr.add_argument("--books", default=None, help="book ids to remove, e.g. 4-38,42")
+    pr.add_argument("--work-keys", default=None, help="comma-separated work keys to remove")
+    pr.add_argument("--delete-sources", action="store_true",
+                    help="also unlink the source files under READER_INGEST")
+    pr.add_argument("--dry-run", action="store_true", help="list matches; make no changes")
+    pr.add_argument("--yes", action="store_true", help="confirm the deletion")
+    pr.set_defaults(func=cmd_prune)
 
     ev = sub.add_parser("eval", help="recall@10 across models; pin the dimensionality")
     ev.add_argument("--models", default=None, help="comma-separated model ids")

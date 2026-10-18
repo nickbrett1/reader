@@ -34,6 +34,32 @@ This project includes the following capabilities:
    pytest -v
    ```
 
+## Corpus scope
+
+The corpus is video-game books only. A staging tree can hold unrelated books
+without re-ingesting them: list a directory or file per line in
+`.ingestignore` at the root of `READER_INGEST` (blank lines and `#` comments
+are ignored; a bare name matches that path component anywhere).
+
+```
+# /volume1/homes/nick/Books/.ingestignore
+Data Visualization
+Machine Learning, AI and Bots
+```
+
+To remove books that were already ingested, use the `prune` verb. It deletes
+the book, pages, chunks, images and orphaned concepts from SQLite, unlinks the
+image blobs, then prunes and compacts the vector index. Rehearse first:
+
+```bash
+reader prune --books 4-38 --dry-run   # prints the matching work keys
+reader prune --books 4-38 --yes       # ids or ranges; or --work-keys a,b
+```
+
+`--delete-sources` also unlinks each book's file under `READER_INGEST` (only
+useful when the staging tree is writable; the deployed container mounts it
+read-only).
+
 ## Doppler
 
 This project uses Doppler for secrets from the shared `common` project

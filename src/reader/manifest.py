@@ -14,6 +14,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import warnings
 from dataclasses import dataclass, field
@@ -21,6 +22,12 @@ from pathlib import Path
 
 SKIP_DIR_NAMES = {"@eaDir", "#recycle", ".DS_Store", "._.DS_Store"}
 SKIP_FILE_NAMES = {".DS_Store", "Thumbs.db"}
+
+#: Optional ignore file at the root of the staging tree.  One pattern per line
+#: (``#`` comments and blank lines ignored).  A pattern without ``/`` matches
+#: any path component, so ``AI Books`` excludes that directory wherever it
+#: appears; a pattern with ``/`` matches the relative path from the root.
+IGNORE_FILE = ".ingestignore"
 
 #: Extension -> canonical format name.
 FORMATS = {
@@ -74,9 +81,45 @@ def _work_key(rel_dir: str, stem: str) -> str:
     return f"{rel_dir}/{stem}" if rel_dir else stem
 
 
+def read_ignore(root: Path) -> list[str]:
+    """Read ``.ingestignore`` at the staging root (empty when absent)."""
+    path = Path(root) / IGNORE_FILE
+    if not path.is_file():
+        return []
+    patterns: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            patterns.append(line)
+    return patterns
+
+
+def is_ignored(relpath: Path | str, patterns: list[str]) -> bool:
+    """True when a relative path matches one of the ignore patterns."""
+    rel = Path(relpath)
+    posix = rel.as_posix()
+    for raw in patterns:
+        pattern = raw.rstrip("/")
+        if not pattern:
+            continue
+        if "/" in pattern:
+            if posix == pattern or posix.startswith(pattern + "/"):
+                return True
+            if fnmatch.fnmatch(posix, pattern):
+                return True
+        elif any(fnmatch.fnmatch(part, pattern) for part in rel.parts):
+            return True
+    return False
+
+
 def walk(ingest_dir: Path) -> list[SourceFile]:
-    """Return every supported source file under ``ingest_dir``, sorted."""
+    """Return every supported source file under ``ingest_dir``, sorted.
+
+    Paths matching :data:`IGNORE_FILE` are skipped, so an off-topic folder can
+    stay in the library without re-entering the corpus on the next pipeline run.
+    """
     root = Path(ingest_dir)
+    patterns = read_ignore(root)
     out: list[SourceFile] = []
     for path in sorted(root.rglob("*")):
         if any(part in SKIP_DIR_NAMES for part in path.parts):
@@ -89,6 +132,8 @@ def walk(ingest_dir: Path) -> list[SourceFile]:
         if fmt is None:
             continue
         rel = path.relative_to(root)
+        if is_ignored(rel, patterns):
+            continue
         out.append(
             SourceFile(
                 path=path,
