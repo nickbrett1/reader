@@ -5,6 +5,9 @@ Backfill of the genproj secret-scan gate into `nickbrett1/reader`, following
 
 Date: 2026-10-18
 Status: complete — local hook installed, CI step added, scan exits 0.
+Follow-up: the historical finding is now *caught* by a narrow custom rule and
+suppressed by one reviewed fingerprint (see "Follow-up: the rule for the
+indirection shape" below).
 
 ## Files added (verbatim from the templates)
 
@@ -112,7 +115,7 @@ Consequences:
 If we want the gate to catch this shape in future, the correct fix is a narrow
 custom rule in `.gitleaks.toml` (or an upstream rule), not a suppression — that
 is deliberately out of scope for this verbatim backfill and should be a
-separate, reviewed change.
+separate, reviewed change. It was done, as that separate change; see below.
 
 ## Verification
 
@@ -120,3 +123,52 @@ separate, reviewed change.
 * `pytest -q` — 91 passed.
 * `git config --get core.hooksPath` — `.githooks`.
 * Full-history scan — exit 0.
+
+## Follow-up: the rule for the indirection shape
+
+Applied as the separate, reviewed change the first pass deferred. Two rules were
+added to `.gitleaks.toml` (and to the genproj template, so new projects get them):
+
+| rule id | catches | shape |
+| --- | --- | --- |
+| `shell-default-provider-token` | short provider-prefixed tokens (`sk-`, `ghp_`, `AKIA`, `glpat-`, `eyJ`, ...) | `KEY=${KEY:-ghp_<token>}` |
+| `shell-default-high-entropy` | any 24+ char token at entropy >= 3.5 | `KEY=${KEY:-<40 random chars>}` |
+
+They are length-partitioned (short-prefixed vs 24+) so a single secret produces a
+single finding rather than two. A rule-level allowlist with `regexTarget =
+"secret"` and placeholder stopwords (`replace`, `changeme`, `your_`, `example`,
+...) keeps `.env`-example defaults such as `${TOKEN:-REPLACE_ME}` quiet.
+
+Validation with the pinned 8.30.1 binary:
+
+* the historical file now reports exactly one finding:
+  `f3b68a0:scripts/watch_embed_pro.sh:shell-default-high-entropy:9`;
+* a false-positive corpus (`${HOME:-/root}`, `${PATH:-/usr/bin:/bin}`,
+  `${TAG:-sha-abc123def456}`, `${MODE:-production}`,
+  `${X:-REPLACE_ME_WITH_A_LONGER_VALUE_HERE}`, a compose file with
+  `${POSTGRES_PASSWORD:-postgres}`) reports nothing;
+* short provider tokens (`ghp_`, `AKIA`, `xoxb-`, `eyJ` JWTs) report one finding each.
+
+Because the key was already rotated, the history was not rewritten. The one
+historical finding is suppressed with a single fingerprint in `.gitleaksignore`,
+with the reason on the comment lines above it:
+
+```
+f3b68a039a27e8d3c77b50f3aaf29c44d7e1fcf8:scripts/watch_embed_pro.sh:shell-default-high-entropy:9
+```
+
+Full-history scan after the change: `36 commits scanned`, `no leaks found`,
+exit 0. Removing that one line makes the scan fail again with the finding above,
+which is the proof the suppression is doing exactly one thing.
+
+One more thing this change proved, at its own expense: the first attempt to
+commit this memo was blocked by the new hook, because the table above quoted a
+realistic-looking example token. Examples are now masked (`ghp_<token>`, not a
+string the rules can match). That is the gate doing its job on its own author,
+and it is the reason the examples in the generated `description` strings are
+masked too.
+
+Also corrected: the `.gitleaksignore` header claimed a fingerprint may be
+"optionally followed by a reason". gitleaks 8.30.1 does not parse that — a
+trailing reason turns the fingerprint into a non-match and the finding returns.
+Reasons now go on comment lines above the fingerprint.
