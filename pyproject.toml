@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pymupdf>=1.28.2",
-    "ebooklib>=0.18",
+    "ebooklib>=0.20",
     "httpx>=0.28.1",
     "turbopuffer>=0.6",
     "lancedb>=0.40",
