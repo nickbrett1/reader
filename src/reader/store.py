@@ -247,6 +247,19 @@ class Store:
                     tuple(page_ids),
                 )
                 self.conn.execute(
+                    f"DELETE FROM quote_concept WHERE quote_id IN "
+                    f"(SELECT id FROM quote WHERE page_id IN ({pq}))",
+                    tuple(page_ids),
+                )
+                self.conn.execute(
+                    f"DELETE FROM quote_review WHERE quote_id IN "
+                    f"(SELECT id FROM quote WHERE page_id IN ({pq}))",
+                    tuple(page_ids),
+                )
+                self.conn.execute(
+                    f"DELETE FROM quote WHERE page_id IN ({pq})", tuple(page_ids)
+                )
+                self.conn.execute(
                     f"DELETE FROM chunk WHERE page_id IN ({pq})", tuple(page_ids)
                 )
                 self.conn.execute(
@@ -262,6 +275,7 @@ class Store:
                 ).fetchone()
                 if still_used:
                     continue
+                self.conn.execute("DELETE FROM quote_concept WHERE concept_id = ?", (cid,))
                 self.conn.execute("DELETE FROM concept_surface WHERE concept_id = ?", (cid,))
                 self.conn.execute(
                     "DELETE FROM concept_review WHERE from_id = ? OR to_id = ?", (cid, cid)
@@ -311,8 +325,28 @@ class Store:
                 "extractor_version = ?, source_sha256 = ? WHERE id = ?",
                 (text, int(scanned), extractor_version, source_sha256, page_id),
             )
-            # The text changed: chunks cut from the old text are stale.
-            self.conn.execute("DELETE FROM chunk WHERE page_id = ?", (page_id,))
+            # The text changed: chunks and quotes cut from the old text are
+            # stale.  Clear the book's quote checkpoint so the next `quotes`
+            # run revisits the page rather than trusting a stale stamp.
+            self.conn.execute(
+                "DELETE FROM quote_concept WHERE quote_id IN "
+                "(SELECT id FROM quote WHERE page_id = ?)",
+                (page_id,),
+            )
+            self.conn.execute(
+                "DELETE FROM quote_review WHERE quote_id IN "
+                "(SELECT id FROM quote WHERE page_id = ?)",
+                (page_id,),
+            )
+            self.conn.execute("DELETE FROM quote WHERE page_id = ?", (page_id,))
+            self.conn.execute(
+                "DELETE FROM chunk WHERE page_id = ?", (page_id,)
+            )
+            self.conn.execute(
+                "UPDATE book SET quotes_source_sha256 = NULL, quotes_extracted_at = NULL "
+                "WHERE id = ?",
+                (book_id,),
+            )
             self.conn.commit()
             return page_id
 
@@ -502,6 +536,205 @@ class Store:
             )
         self.conn.commit()
 
+    # --- quotes -------------------------------------------------------------
+
+    def concept_id_for_name(self, name: str) -> int | None:
+        row = self.conn.execute(
+            "SELECT id FROM concept WHERE name = ? COLLATE NOCASE LIMIT 1", (name,)
+        ).fetchone()
+        return int(row["id"]) if row else None
+
+    def upsert_quote(
+        self,
+        page_id: int,
+        start: int,
+        end: int,
+        text: str,
+        score: float,
+        kind: str,
+        rationale: str,
+        model_id: str,
+        source_sha256: str,
+        extractor_version: str = schema.QUOTES_VERSION,
+    ) -> int:
+        """Insert or refresh one quote, never delete-first.
+
+        The ``UNIQUE (page_id, start_offset, end_offset)`` key makes a re-run on
+        unchanged text update the score in place instead of creating duplicates
+        or resetting the row's identity.
+        """
+        self.conn.execute(
+            """
+            INSERT INTO quote (page_id, start_offset, end_offset, text, score,
+                               kind, rationale, extractor_version, model_id,
+                               source_sha256)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(page_id, start_offset, end_offset) DO UPDATE SET
+                text = excluded.text, score = excluded.score, kind = excluded.kind,
+                rationale = excluded.rationale,
+                extractor_version = excluded.extractor_version,
+                model_id = excluded.model_id,
+                source_sha256 = excluded.source_sha256
+            """,
+            (page_id, start, end, text, score, kind, rationale,
+             extractor_version, model_id, source_sha256),
+        )
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT id FROM quote WHERE page_id = ? AND start_offset = ? AND end_offset = ?",
+            (page_id, start, end),
+        ).fetchone()
+        return int(row["id"])
+
+    def link_quote_concept(
+        self, quote_id: int, concept_id: int, confidence: float, decided_by: str = "llm"
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO quote_concept (quote_id, concept_id, confidence, decided_by)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(quote_id, concept_id) DO UPDATE SET
+                confidence = excluded.confidence, decided_by = excluded.decided_by
+            """,
+            (quote_id, concept_id, confidence, decided_by),
+        )
+        self.conn.commit()
+
+    def add_quote_review(
+        self, quote_id: int, decision: str, decided_by: str,
+        note: str | None = None, request_id: str | None = None,
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO quote_review (quote_id, decision, decided_by, note, request_id, "
+            "decided_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (quote_id, decision, decided_by, note, request_id, now_iso()),
+        )
+        self.conn.commit()
+
+    def _displayable(self, alias: str, threshold: float) -> str:
+        """SQL fragment: not rejected, not demoted, at or above ``threshold``."""
+        return (
+            f"{alias}.score >= ? AND NOT EXISTS (SELECT 1 FROM quote_review r "
+            f"WHERE r.quote_id = {alias}.id AND r.decision IN ('reject','demote'))"
+        )
+
+    def quotes_for_concept(self, concept_id: int, limit: int = 20,
+                           threshold: float = 0.0) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            f"""
+            SELECT q.id, q.text, q.score, q.kind, q.page_id, p.book_id, p.page_no,
+                   b.title AS book_title, qc.confidence
+            FROM quote_concept qc
+            JOIN quote q ON q.id = qc.quote_id
+            JOIN document_page p ON p.id = q.page_id
+            JOIN book b ON b.id = p.book_id
+            WHERE qc.concept_id = ? AND {self._displayable("q", threshold)}
+            ORDER BY qc.confidence DESC, q.score DESC, q.id
+            LIMIT ?
+            """,
+            (concept_id, threshold, limit),
+        ).fetchall()
+
+    def quote_neighbourhood(self, quote_id: int, limit: int = 10,
+                            threshold: float = 0.0) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            f"""
+            SELECT DISTINCT q2.id, q2.text, q2.score, q2.kind, p.book_id, p.page_no,
+                   bk.title AS book_title
+            FROM quote_concept a
+            JOIN quote_concept qc2 ON qc2.concept_id = a.concept_id AND qc2.quote_id != a.quote_id
+            JOIN quote q2 ON q2.id = qc2.quote_id
+            JOIN document_page p ON p.id = q2.page_id
+            JOIN book bk ON bk.id = p.book_id
+            WHERE a.quote_id = ? AND {self._displayable("q2", threshold)}
+            ORDER BY q2.score DESC, q2.id
+            LIMIT ?
+            """,
+            (quote_id, threshold, limit),
+        ).fetchall()
+
+    def quote_citations(self, quote_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT q.id, q.text, p.page_no, b.id AS book_id, b.title AS book_title,
+                   b.author
+            FROM quote q
+            JOIN document_page p ON p.id = q.page_id
+            JOIN book b ON b.id = p.book_id
+            WHERE q.id = ?
+            """,
+            (quote_id,),
+        ).fetchone()
+
+    def quote_counts_by_book(self) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            """
+            SELECT b.id AS book_id, b.title AS book_title, COUNT(q.id) AS quotes,
+                   AVG(q.score) AS mean_score
+            FROM book b
+            LEFT JOIN document_page p ON p.book_id = b.id
+            LEFT JOIN quote q ON q.page_id = p.id
+            GROUP BY b.id ORDER BY b.id
+            """
+        ).fetchall()
+
+    def quotes_for_image(self, image_id: int, limit: int = 1,
+                         threshold: float = 0.0) -> list[dict[str, object]]:
+        """Quotes for the plate: same page, else the nearest preceding page.
+
+        A quote is attached to a page, never to an image; ``from`` records which
+        fallback was used so the UI can label the provenance honestly.
+        """
+        image = self.conn.execute(
+            "SELECT book_id, page_no FROM image WHERE id = ?", (image_id,)
+        ).fetchone()
+        if image is None or image["book_id"] is None or image["page_no"] is None:
+            return []
+        for relation, page_no in (
+            ("same-page", int(image["page_no"])),
+            ("facing-page", int(image["page_no"]) - 1),
+        ):
+            if page_no < 1:
+                continue
+            rows = self.conn.execute(
+                f"""
+                SELECT q.id, q.text, q.score, q.kind, p.page_no,
+                       b.id AS book_id, b.title AS book_title
+                FROM quote q
+                JOIN document_page p ON p.id = q.page_id
+                JOIN book b ON b.id = p.book_id
+                WHERE p.book_id = ? AND p.page_no = ? AND {self._displayable("q", threshold)}
+                ORDER BY q.score DESC, q.id
+                LIMIT ?
+                """,
+                (image["book_id"], page_no, threshold, limit),
+            ).fetchall()
+            if rows:
+                return [dict(r) | {"from": relation} for r in rows]
+        return []
+
+    # --- per-book quotes checkpoint ----------------------------------------
+
+    def book_quotes_current(self, work_key: str, sha256: str) -> bool:
+        row = self.conn.execute(
+            "SELECT quotes_source_sha256, quotes_extractor_version FROM book "
+            "WHERE work_key = ?",
+            (work_key,),
+        ).fetchone()
+        return bool(
+            row
+            and row["quotes_source_sha256"] == sha256
+            and row["quotes_extractor_version"] == schema.QUOTES_VERSION
+        )
+
+    def mark_book_quotes(self, book_id: int, sha256: str) -> None:
+        self.conn.execute(
+            "UPDATE book SET quotes_source_sha256 = ?, quotes_extractor_version = ?, "
+            "quotes_extracted_at = ? WHERE id = ?",
+            (sha256, schema.QUOTES_VERSION, now_iso(), book_id),
+        )
+        self.conn.commit()
+
     # --- embedding provenance + work queues --------------------------------
 
     def stamp_chunk_embedding(
@@ -649,6 +882,7 @@ class Store:
         tables: Iterable[str] = (
             "book", "document_page", "chunk", "image", "concept",
             "concept_surface", "concept_mention", "concept_review",
+            "quote", "quote_concept", "quote_review",
         )
         out: dict[str, int] = {}
         for t in tables:

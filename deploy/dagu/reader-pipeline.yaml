@@ -48,6 +48,14 @@ steps:
       - condition: "docker exec reader python3 scripts/deepseek_offpeak.py"
         expected: "off-peak"
 
+  # Quote selection: judgement-heavy, so the pro alias; also off-peak only.
+  # It needs concepts to exist (the step above) and needs no vectors.
+  - name: quotes
+    command: docker exec reader reader quotes --llm-model deepseek-v4-pro
+    preconditions:
+      - condition: "docker exec reader python3 scripts/deepseek_offpeak.py"
+        expected: "off-peak"
+
   - name: embed
     command: docker exec reader reader embed
 

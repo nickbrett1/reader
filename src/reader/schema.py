@@ -13,12 +13,16 @@ from __future__ import annotations
 
 #: Version of the SQLite schema.  ``gallery`` refuses to read a database whose
 #: recorded version does not match the one it was built against.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Version of the extraction logic.  Stamped onto every ``document_page`` and
 #: ``image`` row so a re-extract can be scoped to rows produced by an older
 #: extractor instead of re-processing the whole corpus.
 EXTRACTOR_VERSION = "1"
+
+#: Version of the quote-selection logic.  Stamped on every quote and on the
+#: book checkpoint, so a prompt/filter change scopes itself to old rows.
+QUOTES_VERSION = "1"
 
 #: Version of the embedding *configuration* (model family + prompt/template
 #: choices).  Stamped onto every vector's provenance so a model swap can be
@@ -266,6 +270,55 @@ MIGRATIONS: dict[int, str] = {
         usd        REAL    NOT NULL DEFAULT 0,
         measured   INTEGER NOT NULL DEFAULT 0,
         created_at TEXT    NOT NULL
+    );
+    """,
+    # v4 — quotes: verbatim sentence spans, linked to concepts.  A quote is a
+    # range into document_page.text exactly like a chunk; the copy is verified
+    # against the page at insert, so it cannot drift.  A quote carries no
+    # vector of its own: it is already embedded as part of a chunk.
+    4: """
+    ALTER TABLE book ADD COLUMN quotes_source_sha256   TEXT;
+    ALTER TABLE book ADD COLUMN quotes_extractor_version TEXT;
+    ALTER TABLE book ADD COLUMN quotes_extracted_at    TEXT;
+
+    CREATE TABLE IF NOT EXISTS quote (
+        id                INTEGER PRIMARY KEY,
+        page_id           INTEGER NOT NULL REFERENCES document_page(id),
+        start_offset      INTEGER NOT NULL,
+        end_offset        INTEGER NOT NULL,
+        text              TEXT    NOT NULL,
+        score             REAL    NOT NULL,
+        kind              TEXT    NOT NULL,
+        rationale         TEXT,
+        extractor_version TEXT    NOT NULL,
+        model_id          TEXT    NOT NULL DEFAULT '',
+        source_sha256     TEXT    NOT NULL,
+        created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+        UNIQUE (page_id, start_offset, end_offset)
+    );
+    CREATE INDEX IF NOT EXISTS quote_page ON quote(page_id);
+    CREATE INDEX IF NOT EXISTS quote_rank ON quote(score DESC, id);
+
+    CREATE TABLE IF NOT EXISTS quote_concept (
+        quote_id    INTEGER NOT NULL REFERENCES quote(id),
+        concept_id  INTEGER NOT NULL REFERENCES concept(id),
+        confidence  REAL    NOT NULL,
+        decided_by  TEXT    NOT NULL DEFAULT 'llm',
+        created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (quote_id, concept_id)
+    );
+    CREATE INDEX IF NOT EXISTS quote_concept_concept
+        ON quote_concept(concept_id, confidence DESC);
+
+    -- APPEND-ONLY review log.  Display is derived: a quote is shown when it
+    -- has no 'reject' row and its score clears the configured threshold.
+    CREATE TABLE IF NOT EXISTS quote_review (
+        quote_id   INTEGER NOT NULL,
+        decision   TEXT    NOT NULL CHECK (decision IN ('approve','reject','demote')),
+        decided_by TEXT    NOT NULL,
+        note       TEXT,
+        request_id TEXT,
+        decided_at TEXT    NOT NULL DEFAULT (datetime('now'))
     );
     """,
 }

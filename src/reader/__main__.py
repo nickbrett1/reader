@@ -28,6 +28,7 @@ from . import extract as extract_mod
 from . import images as images_mod
 from . import index as index_mod
 from . import manifest as manifest_mod
+from . import quotes as quotes_mod
 from . import schema
 from .config import Config
 from .embed import EmbedClient
@@ -267,6 +268,84 @@ def cmd_concepts(config: Config, args: argparse.Namespace) -> int:
         if args.rebuild_derived:
             store.rebuild_derived()
         print(f"{created} concept mention group(s) processed")
+    return 0
+
+
+def cmd_quotes(config: Config, args: argparse.Namespace) -> int:
+    """Select verbatim pull-quotes per page and link them to concepts."""
+    model = args.llm_model or os.environ.get("READER_QUOTE_MODEL")
+    if not args.dry_run and not model:
+        print(
+            "quotes needs a chat model: pass --llm-model or set READER_QUOTE_MODEL",
+            file=sys.stderr,
+        )
+        return 2
+    only = _book_id_filter(getattr(args, "books", None))
+    with open_store(config) as store, recorded(store, "quotes"):
+        books = store.conn.execute(
+            "SELECT id, work_key, source_sha256 FROM book ORDER BY id"
+        ).fetchall()
+        if only is not None:
+            books = [b for b in books if b["id"] in only]
+        llm = (
+            quotes_mod.gateway_quote_llm(
+                config.litellm_base_url, config.litellm_master_key, model
+            )
+            if model
+            else None
+        )
+        written = 0
+        for b in books:
+            if not args.force and store.book_quotes_current(b["work_key"], b["source_sha256"]):
+                print(f"{b['work_key']}: skipped (quotes current)")
+                continue
+            pages = store.conn.execute(
+                "SELECT id, page_no, text, source_sha256, scanned FROM document_page "
+                "WHERE book_id = ? ORDER BY page_no",
+                (b["id"],),
+            ).fetchall()
+            if args.limit:
+                pages = pages[: args.limit]
+            known = [
+                r["name"]
+                for r in store.conn.execute(
+                    "SELECT DISTINCT c.name FROM concept c "
+                    "JOIN concept_mention m ON m.concept_id = c.id "
+                    "JOIN document_page p ON p.id = m.page_id "
+                    "WHERE p.book_id = ? ORDER BY c.name",
+                    (b["id"],),
+                )
+            ]
+            if args.dry_run:
+                candidates = sum(
+                    len(quotes_mod.candidate_spans(p["text"]))
+                    for p in pages
+                    if args.include_scanned or not p["scanned"]
+                )
+                print(
+                    f"[dry-run] {b['work_key']}: {len(pages)} page(s), "
+                    f"{candidates} candidate(s), {len(known)} known concept(s)"
+                )
+                continue
+            book_written = 0
+            for page in pages:
+                if page["scanned"] and not args.include_scanned:
+                    continue
+                for q in quotes_mod.select_quotes(page["text"], llm, known):
+                    qid = store.upsert_quote(
+                        page["id"], q.start, q.end, q.text, q.score, q.kind,
+                        q.rationale, model or "", page["source_sha256"],
+                    )
+                    for name in q.concepts:
+                        cid = store.concept_id_for_name(name)
+                        if cid is not None:
+                            store.link_quote_concept(qid, cid, q.score)
+                    book_written += 1
+            # Stamp only after every page of the book landed.
+            store.mark_book_quotes(b["id"], b["source_sha256"])
+            written += book_written
+            print(f"{b['work_key']}: {book_written} quote(s)")
+        print(f"{written} quote(s) written" if not args.dry_run else "[dry-run] no changes made")
     return 0
 
 
@@ -657,6 +736,17 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--force", action="store_true", help="re-extract even if current")
     k.add_argument("--rebuild-derived", action="store_true")
     k.set_defaults(func=cmd_concepts)
+
+    qp = sub.add_parser("quotes", help="select pull-quotes and link them to concepts")
+    qp.add_argument("--books", default=None, help="comma-separated book ids to restrict the pass")
+    qp.add_argument("--limit", type=int, default=0, help="pages per book (calibration)")
+    qp.add_argument("--force", action="store_true", help="re-quote even if the book is current")
+    qp.add_argument("--dry-run", action="store_true", help="report candidates; no API calls")
+    qp.add_argument("--llm-model", default=None,
+                    help="gateway chat model (default $READER_QUOTE_MODEL)")
+    qp.add_argument("--include-scanned", action="store_true",
+                    help="also quote OCR'd pages (excluded by default)")
+    qp.set_defaults(func=cmd_quotes)
 
     em = sub.add_parser("embed", help="embed text/images/concepts via the gateway")
     em.add_argument("--model", default=None)
