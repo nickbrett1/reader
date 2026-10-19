@@ -399,10 +399,6 @@ def cmd_export_quotes(config: Config, args: argparse.Namespace) -> int:
     """
     only = _book_id_filter(getattr(args, "books", None))
     model = args.jev_model
-    if args.jev and not config.litellm_master_key:
-        print("--jev needs LITELLM_MASTER_KEY (the proxy injects the TypeSafe key)",
-              file=sys.stderr)
-        return 2
     with open_store(config) as store, recorded(store, "export-quotes"):
         items = store.quotes_for_export(
             only,
@@ -419,6 +415,12 @@ def cmd_export_quotes(config: Config, args: argparse.Namespace) -> int:
             print(f"[dry-run] {len(items)} quote(s) from {len(books)} book(s); "
                   f"{'would call Jev' if args.jev else 'no scoring'}")
             return 0
+        # Checked after the dry-run return: a dry run makes no calls, so it
+        # must not demand a key it will never use.
+        if args.jev and not config.litellm_master_key:
+            print("--jev needs LITELLM_MASTER_KEY (the proxy injects the "
+                  "TypeSafe key)", file=sys.stderr)
+            return 2
         if args.jev and items:
             calls = jev_mod.gateway_ask(
                 config.litellm_base_url, config.litellm_master_key, model
