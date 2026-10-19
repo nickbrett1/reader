@@ -341,8 +341,11 @@ def cmd_quotes(config: Config, args: argparse.Namespace) -> int:
                         if cid is not None:
                             store.link_quote_concept(qid, cid, q.score)
                     book_written += 1
-            # Stamp only after every page of the book landed.
-            store.mark_book_quotes(b["id"], b["source_sha256"])
+            # Stamp only when the whole book was processed: a --limit run is a
+            # calibration slice, not a completed book, and must not make the
+            # next full run skip the untouched pages.
+            if not args.limit:
+                store.mark_book_quotes(b["id"], b["source_sha256"])
             written += book_written
             print(f"{b['work_key']}: {book_written} quote(s)")
         print(f"{written} quote(s) written" if not args.dry_run else "[dry-run] no changes made")
