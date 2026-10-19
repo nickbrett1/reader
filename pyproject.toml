@@ -10,7 +10,7 @@ dependencies = [
     "httpx>=0.28.1",
     "turbopuffer>=0.6",
     "lancedb>=0.40",
-    "pillow>=10",
+    "pillow>=12.3.0",
     "pyyaml>=6"
 ]
 
