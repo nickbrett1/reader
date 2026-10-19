@@ -717,6 +717,83 @@ class Store:
                 return [dict(r) | {"from": relation} for r in rows]
         return []
 
+    def quotes_for_export(
+        self,
+        book_ids: set[int] | None = None,
+        *,
+        min_score: float = 0.0,
+        limit: int = 0,
+        with_context: bool = False,
+    ) -> list[dict[str, object]]:
+        """Quotes as annotation items, ranked by score.
+
+        Everything an annotator needs to judge one quote without a second
+        query: the span, its provenance, the concepts it was linked to, and
+        optionally the page text it came from (so the grader can see the
+        sentence in its paragraph, not in a vacuum).
+        """
+        sql = [
+            "SELECT q.id, q.text, q.score, q.kind, q.page_id, p.page_no,",
+            "       b.id AS book_id, COALESCE(b.title, b.work_key) AS book_title,",
+            "       b.work_key,",
+            "       p.text AS page_text",
+            "  FROM quote q",
+            "  JOIN document_page p ON p.id = q.page_id",
+            "  JOIN book b ON b.id = p.book_id",
+            " WHERE q.score >= ?",
+        ]
+        params: list[object] = [min_score]
+        if book_ids:
+            sql.append(f" AND b.id IN ({','.join('?' * len(book_ids))})")
+            params.extend(sorted(book_ids))
+        sql.append(" ORDER BY q.score DESC, q.id")
+        if limit:
+            sql.append(" LIMIT ?")
+            params.append(limit)
+        rows = self.conn.execute("\n".join(sql), params).fetchall()
+        if not rows:
+            return []
+        ids = [int(r["id"]) for r in rows]
+        concepts = self._concepts_by_quote(ids)
+        out: list[dict[str, object]] = []
+        for r in rows:
+            item: dict[str, object] = {
+                "id": f"q{r['id']}",
+                "quote_id": int(r["id"]),
+                "text": r["text"],
+                "score": float(r["score"]),
+                "kind": r["kind"],
+                "book_id": int(r["book_id"]),
+                "book_title": r["book_title"],
+                "work_key": r["work_key"],
+                "page_id": int(r["page_id"]),
+                "page_no": r["page_no"],
+                "concepts": concepts.get(int(r["id"]), []),
+            }
+            if with_context:
+                item["context"] = r["page_text"]
+            out.append(item)
+        return out
+
+    def _concepts_by_quote(self, quote_ids: list[int]) -> dict[int, list[str]]:
+        if not quote_ids:
+            return {}
+        marks = ",".join("?" * len(quote_ids))
+        rows = self.conn.execute(
+            f"""
+            SELECT qc.quote_id, c.name
+              FROM quote_concept qc
+              JOIN concept c ON c.id = qc.concept_id
+             WHERE qc.quote_id IN ({marks})
+             ORDER BY qc.confidence DESC, c.name
+            """,
+            quote_ids,
+        ).fetchall()
+        out: dict[int, list[str]] = {}
+        for r in rows:
+            out.setdefault(int(r["quote_id"]), []).append(r["name"])
+        return out
+
     # --- per-book quotes checkpoint ----------------------------------------
 
     def quote_page_current(self, page_id: int, sha256: str) -> bool:

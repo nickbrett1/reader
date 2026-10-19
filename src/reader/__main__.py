@@ -5,7 +5,8 @@ The app owns its entry point (genproj emits no stub ``__main__.py`` when a
 
 Verbs are the ``dagu`` task surface (§5.2):
 
-    manifest  extract  images  chunk  concepts  embed  eval  reembed
+    manifest  extract  images  chunk  concepts  quotes  export-quotes
+    embed  eval  reembed  prune  index
 
 Every stage is idempotent and resumable; re-running ``embed`` after a model
 change is the normal path, not an exception.
@@ -17,6 +18,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -27,6 +29,7 @@ from . import concepts as concepts_mod
 from . import extract as extract_mod
 from . import images as images_mod
 from . import index as index_mod
+from . import jev as jev_mod
 from . import manifest as manifest_mod
 from . import quotes as quotes_mod
 from . import schema
@@ -385,6 +388,71 @@ def _page_for_offset(pages: Sequence[object], offset: int):
             return p
         cursor = nxt
     return pages[-1] if pages else None
+
+
+def cmd_export_quotes(config: Config, args: argparse.Namespace) -> int:
+    """Write quotes as JSONL annotation items (optionally Jev-scored).
+
+    Deterministic and read-only apart from an optional Jev pass, which is one
+    batched system-one call per ``--jev-batch`` quotes. Potato reads this file,
+    never the SQLite database, so the two stay independently upgradeable.
+    """
+    only = _book_id_filter(getattr(args, "books", None))
+    model = args.jev_model
+    if args.jev and not config.litellm_master_key:
+        print("--jev needs LITELLM_MASTER_KEY (the proxy injects the TypeSafe key)",
+              file=sys.stderr)
+        return 2
+    with open_store(config) as store, recorded(store, "export-quotes"):
+        items = store.quotes_for_export(
+            only,
+            min_score=args.min_score,
+            limit=args.limit,
+            with_context=args.include_context,
+        )
+        if args.sample and len(items) > args.sample:
+            rng = random.Random(args.seed)
+            items = rng.sample(items, args.sample)
+            items.sort(key=lambda it: (-float(it["score"]), int(it["quote_id"])))
+        if args.dry_run:
+            books = {it["book_id"] for it in items}
+            print(f"[dry-run] {len(items)} quote(s) from {len(books)} book(s); "
+                  f"{'would call Jev' if args.jev else 'no scoring'}")
+            return 0
+        if args.jev and items:
+            calls = jev_mod.gateway_ask(
+                config.litellm_base_url, config.litellm_master_key, model
+            )
+            scores = jev_mod.display_confidence(
+                [str(it["text"]) for it in items], call=calls, batch=args.jev_batch
+            )
+            for item, value in zip(items, scores, strict=True):
+                item["jev"] = {"model": model, "display": value}
+                # Potato's static source reads model_pred.{label,confidence};
+                # the claim is "this belongs on a plate", so that is the label
+                # the certified cut is tested against.
+                if value is not None:
+                    item["model_pred"] = {"label": "plate", "confidence": value}
+        lines = "".join(json.dumps(it, ensure_ascii=False) + "\n" for it in items)
+        if args.out:
+            out = Path(args.out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(lines, encoding="utf-8")
+            target = str(out)
+        else:
+            sys.stdout.write(lines)
+            target = "stdout"
+        scored = [it["jev"]["display"] for it in items
+                  if it.get("jev") and it["jev"]["display"] is not None]
+        summary = f"{len(items)} quote(s) -> {target}"
+        if args.jev:
+            failed = len(items) - len(scored)
+            summary += (f", jev scored {len(scored)}"
+                        + (f" ({failed} without an opinion)" if failed else ""))
+            if scored:
+                summary += f", P(display) {min(scored):.2f}-{max(scored):.2f}"
+        print(summary, file=sys.stderr)
+    return 0
 
 
 def cmd_embed(config: Config, args: argparse.Namespace) -> int:
@@ -775,6 +843,27 @@ def build_parser() -> argparse.ArgumentParser:
                     help="also quote OCR'd pages (excluded by default)")
     qp.set_defaults(func=cmd_quotes)
 
+    ex = sub.add_parser("export-quotes", help="write quotes as JSONL annotation items")
+    ex.add_argument("--out", default=None, help="output .jsonl (default: stdout)")
+    ex.add_argument("--books", default=None, help="comma-separated book ids")
+    ex.add_argument("--min-score", type=float, default=0.0,
+                    help="only quotes at or above this model score (default 0.0)")
+    ex.add_argument("--limit", type=int, default=0, help="at most N quotes")
+    ex.add_argument("--sample", type=int, default=0,
+                    help="draw a random sample of N quotes (with --seed)")
+    ex.add_argument("--seed", type=int, default=0, help="sampling seed (default 0)")
+    ex.add_argument("--include-context", action="store_true",
+                    help="carry the page text so a grader sees the paragraph")
+    ex.add_argument("--jev", action="store_true",
+                    help="judge each quote with Jev (P(worth displaying))")
+    ex.add_argument("--jev-model", default=jev_mod.DEFAULT_MODEL,
+                    help="System One model (default jev-latest)")
+    ex.add_argument("--jev-batch", type=int, default=25,
+                    help="quotes per system-one call (default 25)")
+    ex.add_argument("--dry-run", action="store_true",
+                    help="report the counts; no Jev calls, no file written")
+    ex.set_defaults(func=cmd_export_quotes)
+
     em = sub.add_parser("embed", help="embed text/images/concepts via the gateway")
     em.add_argument("--model", default=None)
     em.add_argument("--dimensions", type=int, default=None)
@@ -829,6 +918,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(args.func(config, args))
     except manifest_mod.ManifestError as exc:
         print(f"manifest error: {exc}", file=sys.stderr)
+        return 1
+    except jev_mod.JevError as exc:
+        print(f"jev error: {exc}", file=sys.stderr)
         return 1
 
 
