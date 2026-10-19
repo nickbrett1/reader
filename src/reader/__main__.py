@@ -281,15 +281,17 @@ def cmd_quotes(config: Config, args: argparse.Namespace) -> int:
         )
         return 2
     only = _book_id_filter(getattr(args, "books", None))
-    with open_store(config) as store, recorded(store, "quotes"):
+    with open_store(config) as store, recorded(store, "quotes") as run_id:
         books = store.conn.execute(
             "SELECT id, work_key, source_sha256 FROM book ORDER BY id"
         ).fetchall()
         if only is not None:
             books = [b for b in books if b["id"] in only]
+        usage: dict[str, int] = {}
         llm = (
             quotes_mod.gateway_quote_llm(
-                config.litellm_base_url, config.litellm_master_key, model
+                config.litellm_base_url, config.litellm_master_key, model,
+                usage=usage,
             )
             if model
             else None
@@ -328,6 +330,7 @@ def cmd_quotes(config: Config, args: argparse.Namespace) -> int:
                 )
                 continue
             book_written = 0
+            usage.clear()
             for page in pages:
                 if page["scanned"] and not args.include_scanned:
                     continue
@@ -341,6 +344,13 @@ def cmd_quotes(config: Config, args: argparse.Namespace) -> int:
                         if cid is not None:
                             store.link_quote_concept(qid, cid, q.score)
                     book_written += 1
+            tokens = usage.get("total_tokens", 0)
+            if tokens:
+                # Token accounting from the gateway; model pricing is not
+                # applied here (usd stays 0, measured tokens are visible).
+                store.record_spend(
+                    run_id, "quotes", model or "", book_written, tokens, 0.0, True
+                )
             # Stamp only when the whole book was processed: a --limit run is a
             # calibration slice, not a completed book, and must not make the
             # next full run skip the untouched pages.

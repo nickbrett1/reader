@@ -197,8 +197,13 @@ def gateway_quote_llm(
     model: str,
     *,
     timeout: float = 300.0,
+    usage: dict[str, int] | None = None,
 ) -> Callable[[str], object]:
-    """Build a callable that asks the gateway to select quotes from a prompt."""
+    """Build a callable that asks the gateway to select quotes from a prompt.
+
+    When ``usage`` is supplied, each call accumulates the gateway's reported
+    prompt/completion tokens into it, so the caller can record visible spend.
+    """
 
     def _call(prompt: str) -> object:
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
@@ -213,7 +218,11 @@ def gateway_quote_llm(
             timeout=timeout,
         )
         resp.raise_for_status()
-        return _parse_array(resp.json()["choices"][0]["message"]["content"])
+        body = resp.json()
+        if usage is not None:
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                usage[key] = usage.get(key, 0) + int((body.get("usage") or {}).get(key) or 0)
+        return _parse_array(body["choices"][0]["message"]["content"])
 
     return _call
 
