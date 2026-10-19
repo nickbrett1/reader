@@ -260,6 +260,9 @@ class Store:
                     f"DELETE FROM quote WHERE page_id IN ({pq})", tuple(page_ids)
                 )
                 self.conn.execute(
+                    f"DELETE FROM quote_page WHERE page_id IN ({pq})", tuple(page_ids)
+                )
+                self.conn.execute(
                     f"DELETE FROM chunk WHERE page_id IN ({pq})", tuple(page_ids)
                 )
                 self.conn.execute(
@@ -339,6 +342,7 @@ class Store:
                 (page_id,),
             )
             self.conn.execute("DELETE FROM quote WHERE page_id = ?", (page_id,))
+            self.conn.execute("DELETE FROM quote_page WHERE page_id = ?", (page_id,))
             self.conn.execute(
                 "DELETE FROM chunk WHERE page_id = ?", (page_id,)
             )
@@ -715,6 +719,28 @@ class Store:
 
     # --- per-book quotes checkpoint ----------------------------------------
 
+    def quote_page_current(self, page_id: int, sha256: str) -> bool:
+        row = self.conn.execute(
+            "SELECT source_sha256, extractor_version FROM quote_page WHERE page_id = ?",
+            (page_id,),
+        ).fetchone()
+        return bool(
+            row
+            and row["source_sha256"] == sha256
+            and row["extractor_version"] == schema.QUOTES_VERSION
+        )
+
+    def mark_quote_page(self, page_id: int, sha256: str) -> None:
+        self.conn.execute(
+            "INSERT INTO quote_page (page_id, source_sha256, extractor_version, extracted_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(page_id) DO UPDATE SET "
+            "source_sha256 = excluded.source_sha256, "
+            "extractor_version = excluded.extractor_version, "
+            "extracted_at = excluded.extracted_at",
+            (page_id, sha256, schema.QUOTES_VERSION, now_iso()),
+        )
+        self.conn.commit()
+
     def book_quotes_current(self, work_key: str, sha256: str) -> bool:
         row = self.conn.execute(
             "SELECT quotes_source_sha256, quotes_extractor_version FROM book "
@@ -882,7 +908,7 @@ class Store:
         tables: Iterable[str] = (
             "book", "document_page", "chunk", "image", "concept",
             "concept_surface", "concept_mention", "concept_review",
-            "quote", "quote_concept", "quote_review",
+            "quote", "quote_concept", "quote_review", "quote_page",
         )
         out: dict[str, int] = {}
         for t in tables:

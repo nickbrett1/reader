@@ -13,7 +13,7 @@ from __future__ import annotations
 
 #: Version of the SQLite schema.  ``gallery`` refuses to read a database whose
 #: recorded version does not match the one it was built against.
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 #: Version of the extraction logic.  Stamped onto every ``document_page`` and
 #: ``image`` row so a re-extract can be scoped to rows produced by an older
@@ -296,7 +296,7 @@ MIGRATIONS: dict[int, str] = {
         created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
         UNIQUE (page_id, start_offset, end_offset)
     );
-    CREATE INDEX IF NOT EXISTS quote_page ON quote(page_id);
+    CREATE INDEX IF NOT EXISTS idx_quote_page ON quote(page_id);
     CREATE INDEX IF NOT EXISTS quote_rank ON quote(score DESC, id);
 
     CREATE TABLE IF NOT EXISTS quote_concept (
@@ -319,6 +319,21 @@ MIGRATIONS: dict[int, str] = {
         note       TEXT,
         request_id TEXT,
         decided_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+    """,
+    # v5 — per-page quote checkpoints, so a killed run resumes at the page
+    # rather than re-paying for every page of the book.
+    5: """
+    -- v4 named the per-page quote index ``quote_page``; a checkpoint table of
+    -- that name would collide (tables and indexes share one namespace).
+    DROP INDEX IF EXISTS quote_page;
+    CREATE INDEX IF NOT EXISTS idx_quote_page ON quote(page_id);
+
+    CREATE TABLE IF NOT EXISTS quote_page (
+        page_id    INTEGER PRIMARY KEY REFERENCES document_page(id),
+        source_sha256 TEXT NOT NULL,
+        extractor_version TEXT NOT NULL,
+        extracted_at TEXT NOT NULL
     );
     """,
 }

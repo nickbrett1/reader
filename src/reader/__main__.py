@@ -331,8 +331,17 @@ def cmd_quotes(config: Config, args: argparse.Namespace) -> int:
                 continue
             book_written = 0
             usage.clear()
+            skipped = 0
             for page in pages:
                 if page["scanned"] and not args.include_scanned:
+                    continue
+                # Page-level checkpoint: a killed run resumes here instead of
+                # re-paying for every page already processed.  --force ignores
+                # the checkpoint and re-selects every page.
+                if not args.force and store.quote_page_current(
+                    page["id"], page["source_sha256"]
+                ):
+                    skipped += 1
                     continue
                 for q in quotes_mod.select_quotes(page["text"], llm, known):
                     qid = store.upsert_quote(
@@ -344,6 +353,10 @@ def cmd_quotes(config: Config, args: argparse.Namespace) -> int:
                         if cid is not None:
                             store.link_quote_concept(qid, cid, q.score)
                     book_written += 1
+                # Mark the page only after its quotes and concept links are
+                # committed, so a kill mid-page leaves the page unmarked and
+                # the next run repeats just that page.
+                store.mark_quote_page(page["id"], page["source_sha256"])
             tokens = usage.get("total_tokens", 0)
             if tokens:
                 # Token accounting from the gateway; model pricing is not
@@ -357,7 +370,8 @@ def cmd_quotes(config: Config, args: argparse.Namespace) -> int:
             if not args.limit:
                 store.mark_book_quotes(b["id"], b["source_sha256"])
             written += book_written
-            print(f"{b['work_key']}: {book_written} quote(s)")
+            resume = f", {skipped} page(s) resumed" if skipped else ""
+            print(f"{b['work_key']}: {book_written} quote(s){resume}")
         print(f"{written} quote(s) written" if not args.dry_run else "[dry-run] no changes made")
     return 0
 

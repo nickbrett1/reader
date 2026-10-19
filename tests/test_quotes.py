@@ -125,6 +125,62 @@ def test_cli_writes_quotes_then_skips_unchanged_book(tmp_path, monkeypatch):
         store.close()
 
 
+def test_cli_resumes_at_page_level_after_a_partial_run(tmp_path, monkeypatch):
+    import pymupdf
+
+    from reader.__main__ import main
+
+    ingest, data = tmp_path / "ingest", tmp_path / "data"
+    ingest.mkdir()
+    doc = pymupdf.open()
+    for n in (1, 2):
+        page = doc.new_page()
+        page.insert_text(
+            (72, 72),
+            f"Chapter {n} opens on the ruin no one was meant to enter, and the "
+            f"wind knows it well. A second sentence follows here so page {n} "
+            "has a pair to work with.",
+        )
+    doc.save(str(ingest / "book.pdf"))
+    doc.close()
+    monkeypatch.setenv("READER_INGEST", str(ingest))
+    monkeypatch.setenv("READER_DATA", str(data))
+    assert main(["extract"]) == 0
+    assert main(["chunk"]) == 0
+
+    calls: list[str] = []
+
+    def fake_llm(*_args, **_kwargs):
+        def _call(prompt: str) -> object:
+            calls.append(prompt)
+            return [{"index": 0, "score": 0.8, "kind": "statement", "concepts": []}]
+
+        return _call
+
+    monkeypatch.setattr(quotes, "gateway_quote_llm", fake_llm)
+
+    # A one-page slice checkpoints that page but must not stamp the book.
+    assert main(["quotes", "--llm-model", "fake", "--limit", "1"]) == 0
+    assert len(calls) == 1
+
+    # The killed-run stand-in: the full run pays only for the page that has
+    # no checkpoint yet.
+    assert main(["quotes", "--llm-model", "fake"]) == 0
+    assert len(calls) == 2
+
+    store = Store(data / "reader.db")
+    try:
+        assert store.stats()["quote_page"] == 2
+        assert store.book_quotes_current("book", store.conn.execute(
+            "SELECT source_sha256 FROM book").fetchone()[0])
+    finally:
+        store.close()
+
+    # --force deliberately redoes work the checkpoints would skip.
+    assert main(["quotes", "--llm-model", "fake", "--force"]) == 0
+    assert len(calls) == 4
+
+
 def test_store_links_reads_and_review(tmp_path):
     store = Store(tmp_path / "reader.db")
     try:
