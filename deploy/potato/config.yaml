@@ -1,0 +1,34 @@
+# Potato project config — reader quote calibration (t_display).
+#
+# Host/ops:  infra/um790/um790-potato-install.md
+# Design:    projects/reader/reader-quotes-linked-to-concepts.md §6
+# Items:     scripts/potato_calibration_set.py, built from a Jev probe run.
+#
+# 296 sentences, stratified across the candidate judge's own probability, so the
+# risk-coverage curve has points where the threshold would actually cut.
+#
+# `model_pred.confidence` carries the CANDIDATE prompt's P(display). That single
+# field is what `selective_risk` reads as raw_conf. The baseline prompt's score
+# is kept in `meta` so the same labels can score both judges offline; only this
+# one field needs repointing if the baseline wins.
+#
+# The item text is the sentence alone — the judge never saw the page, so
+# labelling in context would certify an easier question than the one asked.
+annotation_task_name: "reader quote calibration — t_display"
+task_dir: .
+data_files:
+  - data/quotes-calibration.jsonl
+item_properties:
+  id_key: id
+  text_key: text
+output_annotation_dir: output
+annotation_schemes:
+  - annotation_type: radio
+    name: display
+    description: "Would you print this sentence, verbatim, as a pull-quote in this art book?"
+    labels:
+      - keep
+      - drop
+      - unsure
+    label_requirement:
+      required: true
