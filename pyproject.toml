@@ -20,7 +20,7 @@ reader = "reader.__main__:main"
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "ruff>=0.17.0"
+    "ruff>=0.17.2"
 ]
 
 [build-system]
