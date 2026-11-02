@@ -5,7 +5,7 @@ description = "A reader project generated with genproj"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "pymupdf>=1.28.2",
+    "pymupdf>=2.0",
     "ebooklib>=0.20",
     "httpx>=0.28.1",
     "turbopuffer>=0.6",
